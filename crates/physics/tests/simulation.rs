@@ -331,6 +331,102 @@ fn backward_euler_advances_the_default_rope_without_substeps() {
 }
 
 #[test]
+fn tr_bdf2_advances_the_default_rope_without_substeps() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+
+    assert_eq!(simulation.recommended_substeps(dt).unwrap(), 1);
+    for _ in 0..(2 * 240) {
+        simulation.step(dt).unwrap();
+    }
+
+    assert!(simulation.positions().iter().all(|value| value.is_finite()));
+    assert!(simulation.diagnostics().maximum_absolute_strain < 0.1);
+}
+
+#[test]
+fn tr_bdf2_is_second_order_for_a_single_axial_oscillator() {
+    fn error(dt: f64) -> f64 {
+        let config = SimulationConfig {
+            segment_count: 1,
+            rope_length: 1.0,
+            rope_mass: 0.001,
+            payload_mass: 1.0,
+            axial_rigidity: 100.0,
+            gravity: Vec2::ZERO,
+            air_damping_rate: 0.0,
+            integrator: IntegratorKind::TrBdf2,
+            ..SimulationConfig::default()
+        };
+        let mut simulation = Simulation::new(config).unwrap();
+        let extension = 0.1;
+        simulation.set_payload_target(Some(KinematicTarget::new(
+            Vec2::new(0.0, -(config.rope_length + extension)),
+            Vec2::ZERO,
+        )));
+        simulation.release_payload(Vec2::ZERO);
+
+        let duration = 0.5;
+        let steps = (duration / dt) as usize;
+        for _ in 0..steps {
+            simulation.step(dt).unwrap();
+        }
+
+        let mass = config.payload_mass + 0.5 * config.rope_mass;
+        let frequency = (config.axial_rigidity / config.rope_length / mass).sqrt();
+        let exact_extension = extension * (frequency * duration).cos();
+        let exact_velocity = -extension * frequency * (frequency * duration).sin();
+        let actual_extension = -simulation.payload_position().y - config.rope_length;
+        let actual_velocity = -simulation.payload_velocity().y;
+        ((actual_extension - exact_extension).powi(2)
+            + ((actual_velocity - exact_velocity) / frequency).powi(2))
+        .sqrt()
+    }
+
+    let coarse = error(0.02);
+    let fine = error(0.01);
+    assert!(
+        coarse > 3.5 * fine,
+        "expected second-order convergence, coarse={coarse:e}, fine={fine:e}"
+    );
+}
+
+#[test]
+fn tr_bdf2_damps_an_undamped_oscillator_less_than_backward_euler() {
+    fn retained_energy(integrator: IntegratorKind) -> f64 {
+        let config = SimulationConfig {
+            segment_count: 1,
+            rope_length: 1.0,
+            rope_mass: 0.001,
+            payload_mass: 1.0,
+            axial_rigidity: 100.0,
+            gravity: Vec2::ZERO,
+            air_damping_rate: 0.0,
+            integrator,
+            ..SimulationConfig::default()
+        };
+        let mut simulation = Simulation::new(config).unwrap();
+        simulation.set_payload_target(Some(KinematicTarget::new(Vec2::new(0.0, -1.1), Vec2::ZERO)));
+        simulation.release_payload(Vec2::ZERO);
+        for _ in 0..300 {
+            simulation.step(1.0 / 60.0).unwrap();
+        }
+        simulation.diagnostics().total_mechanical_energy
+    }
+
+    let backward_euler = retained_energy(IntegratorKind::BackwardEuler);
+    let tr_bdf2 = retained_energy(IntegratorKind::TrBdf2);
+    assert!(
+        tr_bdf2 > 5.0 * backward_euler,
+        "expected less numerical damping: TR-BDF2={tr_bdf2:e}, BE={backward_euler:e}"
+    );
+}
+
+#[test]
 #[ignore = "ROS2 is experimental: even free default motion accumulates excessive tensile strain"]
 fn rosenbrock_advances_the_default_rope_without_substeps() {
     let dt = 1.0 / 240.0;
@@ -512,6 +608,62 @@ fn backward_euler_handles_sls_without_air_damping() {
 }
 
 #[test]
+fn tr_bdf2_handles_sls_without_air_damping() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 64,
+        rope_model: RopeModelKind::StandardLinearSolid,
+        axial_rigidity: 30_000.0,
+        transient_axial_rigidity: 15_000.0,
+        axial_viscosity: 1_000.0,
+        air_damping_rate: 0.0,
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+
+    for _ in 0..(2 * 240) {
+        simulation.step(dt).unwrap();
+    }
+
+    assert!(simulation.positions().iter().all(|value| value.is_finite()));
+    assert!(
+        simulation
+            .velocities()
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert!(simulation.diagnostics().maximum_absolute_strain < 0.1);
+}
+
+#[test]
+fn tr_bdf2_handles_kelvin_voigt_without_air_damping() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 64,
+        rope_model: RopeModelKind::KelvinVoigt,
+        axial_viscosity: 1_000.0,
+        air_damping_rate: 0.0,
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+
+    for _ in 0..(2 * 240) {
+        simulation.step(dt).unwrap();
+    }
+
+    assert!(simulation.positions().iter().all(|value| value.is_finite()));
+    assert!(
+        simulation
+            .velocities()
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    assert!(simulation.diagnostics().maximum_absolute_strain < 0.1);
+}
+
+#[test]
 #[ignore = "ROS2 is experimental: maximum-piece SLS can produce a singular block factorization"]
 fn rosenbrock_handles_sls_at_the_maximum_ui_piece_count() {
     let dt = 1.0 / 240.0;
@@ -651,6 +803,31 @@ fn backward_euler_supports_interpolated_payload_motion() {
 #[test]
 fn backward_euler_survives_a_sustained_drag_path() {
     sustained_drag_path(64, IntegratorKind::BackwardEuler);
+}
+
+#[test]
+fn tr_bdf2_survives_a_sustained_drag_path() {
+    sustained_drag_path_with_limits(
+        SimulationConfig {
+            segment_count: 64,
+            integrator: IntegratorKind::TrBdf2,
+            ..SimulationConfig::default()
+        },
+        0.35,
+    );
+}
+
+#[test]
+fn tr_bdf2_sls_survives_a_default_sustained_drag_path() {
+    sustained_drag_path_with_limits(
+        SimulationConfig {
+            segment_count: 20,
+            rope_model: RopeModelKind::StandardLinearSolid,
+            integrator: IntegratorKind::TrBdf2,
+            ..SimulationConfig::default()
+        },
+        0.35,
+    );
 }
 
 #[test]
@@ -956,14 +1133,21 @@ fn rosenbrock_survives_jittered_frontend_mouse_updates() {
 }
 
 fn sustained_drag_path(segment_count: usize, integrator: IntegratorKind) {
-    sustained_drag_path_with_config(SimulationConfig {
-        segment_count,
-        integrator,
-        ..SimulationConfig::default()
-    });
+    sustained_drag_path_with_limits(
+        SimulationConfig {
+            segment_count,
+            integrator,
+            ..SimulationConfig::default()
+        },
+        0.3,
+    );
 }
 
 fn sustained_drag_path_with_config(config: SimulationConfig) {
+    sustained_drag_path_with_limits(config, 0.3);
+}
+
+fn sustained_drag_path_with_limits(config: SimulationConfig, maximum_allowed_strain: f64) {
     let physics_dt = 1.0 / 240.0;
     let frame_dt = 1.0 / 60.0;
     let segment_count = config.segment_count;
@@ -1010,7 +1194,7 @@ fn sustained_drag_path_with_config(config: SimulationConfig) {
     }
 
     assert!(
-        maximum_strain < 0.3,
+        maximum_strain < maximum_allowed_strain,
         "{integrator:?} reached excessive strain {maximum_strain:.3} with {segment_count} pieces"
     );
     assert!(

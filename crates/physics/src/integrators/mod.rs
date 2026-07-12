@@ -3,6 +3,7 @@ pub(crate) mod block_tridiagonal;
 mod rk4;
 mod rosenbrock;
 mod semi_implicit_euler;
+mod tr_bdf2;
 
 use std::error::Error;
 use std::fmt;
@@ -16,6 +17,7 @@ use backward_euler::BackwardEuler;
 use rk4::RungeKutta4;
 use rosenbrock::Rosenbrock2;
 use semi_implicit_euler::SemiImplicitEuler;
+use tr_bdf2::TrBdf2;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AccelerationJacobianBlock {
@@ -108,14 +110,16 @@ pub enum IntegratorKind {
     SemiImplicitEuler,
     RungeKutta4,
     Rosenbrock2,
+    TrBdf2,
     BackwardEuler,
 }
 
 impl IntegratorKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::SemiImplicitEuler,
         Self::RungeKutta4,
         Self::Rosenbrock2,
+        Self::TrBdf2,
         Self::BackwardEuler,
     ];
 
@@ -124,6 +128,7 @@ impl IntegratorKind {
             Self::SemiImplicitEuler => "Semi-implicit Euler",
             Self::RungeKutta4 => "Runge-Kutta 4",
             Self::Rosenbrock2 => "Rosenbrock ROS2 (experimental)",
+            Self::TrBdf2 => "TR-BDF2",
             Self::BackwardEuler => "Backward Euler",
         }
     }
@@ -137,6 +142,7 @@ pub(crate) fn create_integrator(
         IntegratorKind::SemiImplicitEuler => Box::new(SemiImplicitEuler::new(node_count)),
         IntegratorKind::RungeKutta4 => Box::new(RungeKutta4::new(node_count)),
         IntegratorKind::Rosenbrock2 => Box::new(Rosenbrock2::new(node_count)),
+        IntegratorKind::TrBdf2 => Box::new(TrBdf2::new(node_count)),
         IntegratorKind::BackwardEuler => Box::new(BackwardEuler::new(node_count)),
     }
 }
