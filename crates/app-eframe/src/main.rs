@@ -40,6 +40,7 @@ struct RopeSimApp {
     integration_substeps: usize,
     last_frame: Instant,
     dragging_payload: bool,
+    viewport_id: Option<egui::Id>,
     previous_drag_position: Option<Vec2>,
     drag_velocity: Vec2,
     error_message: Option<String>,
@@ -66,6 +67,7 @@ impl RopeSimApp {
             integration_substeps,
             last_frame: Instant::now(),
             dragging_payload: false,
+            viewport_id: None,
             previous_drag_position: None,
             drag_velocity: Vec2::ZERO,
             error_message: None,
@@ -90,15 +92,19 @@ impl RopeSimApp {
 
                 ui.horizontal(|ui| {
                     let pause_label = if self.paused { "Resume" } else { "Pause" };
-                    if ui.button(pause_label).clicked() {
-                        self.paused = !self.paused;
-                        self.accumulator = 0.0;
+                    if ui
+                        .button(pause_label)
+                        .on_hover_text("Shortcut: Space")
+                        .clicked()
+                    {
+                        self.toggle_paused();
                     }
                     if ui
                         .add_enabled(self.paused, egui::Button::new("Single step"))
+                        .on_hover_text("Shortcut: Right Arrow")
                         .clicked()
                     {
-                        self.single_step_requested = true;
+                        self.request_single_step();
                     }
                     if ui.button("Reset").clicked() {
                         reset_requested = true;
@@ -310,10 +316,82 @@ impl RopeSimApp {
         }
     }
 
+    fn handle_keyboard_shortcuts(&mut self, context: &egui::Context) {
+        // Leave arrow keys and Space available to controls while they have
+        // keyboard focus, but treat the simulation viewport as shortcut scope.
+        let focused_widget = context.memory(|memory| memory.focused());
+        if focused_widget.is_some() && focused_widget != self.viewport_id {
+            return;
+        }
+
+        let (toggle_pause, step_forward) = context.input_mut(|input| {
+            let space_pressed = input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Space,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                        ..
+                    }
+                )
+            });
+            let toggle_pause = input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Space,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                        ..
+                    }
+                )
+            });
+
+            if space_pressed {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Space,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                            ..
+                        }
+                    )
+                });
+            }
+
+            let step_forward = input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight);
+            (toggle_pause, step_forward)
+        });
+
+        if toggle_pause {
+            self.toggle_paused();
+        }
+        if step_forward {
+            self.request_single_step();
+        }
+    }
+
+    fn toggle_paused(&mut self) {
+        self.paused = !self.paused;
+        self.accumulator = 0.0;
+        self.single_step_requested = false;
+    }
+
+    fn request_single_step(&mut self) {
+        if self.paused {
+            self.single_step_requested = true;
+        }
+    }
+
     fn viewport(&mut self, root_ui: &mut egui::Ui, frame_dt: f64) {
         egui::CentralPanel::default().show(root_ui, |ui| {
             let size = ui.available_size().max(EguiVec2::new(1.0, 1.0));
             let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
+            self.viewport_id = Some(response.id);
             let transform = ViewTransform::new(response.rect, self.config);
 
             self.update_drag(&response, transform, frame_dt);
@@ -531,6 +609,7 @@ impl eframe::App for RopeSimApp {
         let frame_dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
 
+        self.handle_keyboard_shortcuts(ui.ctx());
         self.controls(ui);
         self.viewport(ui, frame_dt);
         ui.ctx().request_repaint();
