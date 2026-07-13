@@ -1,5 +1,6 @@
 mod backward_euler;
 pub(crate) mod block_tridiagonal;
+mod newton_block_tridiagonal;
 mod rk4;
 mod rosenbrock;
 mod semi_implicit_euler;

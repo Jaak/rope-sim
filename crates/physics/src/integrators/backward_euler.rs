@@ -6,6 +6,7 @@ use faer::sparse::{SparseColMat, Triplet};
 use crate::math::Vec2;
 use crate::state::State;
 
+use super::newton_block_tridiagonal::NewtonBlockTridiagonalSolver;
 use super::{
     AccelerationJacobianBlock, DynamicalSystem, IntegratorStatistics, StepError, TimeIntegrator,
     validate_timestep,
@@ -31,6 +32,7 @@ pub(super) struct BackwardEuler {
     jacobian_triplets: Vec<Triplet<usize, usize, f64>>,
     jacobian_matrix: Option<SparseColMat<usize, f64>>,
     symbolic_lu: Option<SymbolicLu<usize>>,
+    block_solver: NewtonBlockTridiagonalSolver,
     delta: Vec<f64>,
     base_unknowns: Vec<f64>,
     statistics: IntegratorStatistics,
@@ -53,6 +55,7 @@ impl BackwardEuler {
             jacobian_triplets: Vec::with_capacity(20 * node_count),
             jacobian_matrix: None,
             symbolic_lu: None,
+            block_solver: NewtonBlockTridiagonalSolver::new(node_count),
             delta: Vec::new(),
             base_unknowns: Vec::new(),
             statistics: IntegratorStatistics::default(),
@@ -160,21 +163,33 @@ impl BackwardEuler {
                 dt,
                 &mut self.acceleration_jacobian,
             );
-            assemble_residual_jacobian(
-                &self.acceleration_jacobian,
-                &self.node_to_unknown,
-                dimension,
-                dt,
-                &mut self.jacobian_triplets,
-            );
-            solve_sparse_system(
-                dimension,
-                &self.jacobian_triplets,
-                &self.residual,
-                &mut self.delta,
-                &mut self.jacobian_matrix,
-                &mut self.symbolic_lu,
-            )?;
+            if self
+                .block_solver
+                .solve(
+                    &self.acceleration_jacobian,
+                    &self.node_to_unknown,
+                    &self.residual,
+                    dt,
+                    &mut self.delta,
+                )
+                .is_err()
+            {
+                assemble_residual_jacobian(
+                    &self.acceleration_jacobian,
+                    &self.node_to_unknown,
+                    dimension,
+                    dt,
+                    &mut self.jacobian_triplets,
+                );
+                solve_sparse_system(
+                    dimension,
+                    &self.jacobian_triplets,
+                    &self.residual,
+                    &mut self.delta,
+                    &mut self.jacobian_matrix,
+                    &mut self.symbolic_lu,
+                )?;
+            }
             self.statistics.linear_solves += 1;
 
             let mut accepted = false;
@@ -275,6 +290,16 @@ impl TimeIntegrator for BackwardEuler {
 
     fn statistics(&self) -> IntegratorStatistics {
         self.statistics
+    }
+
+    fn recommended_substeps(
+        &self,
+        system: &dyn DynamicalSystem,
+        outer_dt: f64,
+    ) -> Result<usize, StepError> {
+        validate_timestep(outer_dt)?;
+        let boundary_sampling_limit = 0.75 * system.kinematic_timestep_limit();
+        Ok((outer_dt / boundary_sampling_limit).ceil().max(1.0) as usize)
     }
 }
 

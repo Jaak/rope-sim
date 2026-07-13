@@ -195,6 +195,15 @@ impl Simulation {
     }
 
     pub fn step(&mut self, dt: f64) -> Result<Diagnostics, StepError> {
+        self.step_without_diagnostics(dt)?;
+        Ok(self.diagnostics())
+    }
+
+    /// Advance the simulation without traversing the rope to compute diagnostics.
+    ///
+    /// This is useful when an outer frame is split into several physics steps and
+    /// only the state after the final step will be displayed or inspected.
+    pub fn step_without_diagnostics(&mut self, dt: f64) -> Result<(), StepError> {
         let system = RopeDynamics::new(
             &self.config,
             &self.masses,
@@ -207,7 +216,7 @@ impl Simulation {
         self.advance_payload_motion(dt);
         self.cumulative_prescribed_work += self.prescribed_endpoint_power() * dt;
         self.time += dt;
-        Ok(self.diagnostics())
+        Ok(())
     }
 
     pub fn diagnostics(&self) -> Diagnostics {

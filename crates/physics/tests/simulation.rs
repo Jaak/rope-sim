@@ -37,6 +37,29 @@ fn fixed_anchor_never_moves() {
 }
 
 #[test]
+fn stepping_without_diagnostics_preserves_the_simulation_result() {
+    let config = SimulationConfig {
+        integrator: IntegratorKind::BackwardEuler,
+        rope_model: RopeModelKind::StandardLinearSolid,
+        ..SimulationConfig::default()
+    };
+    let mut regular = Simulation::new(config).unwrap();
+    let mut deferred = Simulation::new(config).unwrap();
+    let target = KinematicTarget::new(Vec2::new(0.4, -11.8), Vec2::new(1.5, 0.3));
+    regular.interpolate_payload_target(target, 0.1).unwrap();
+    deferred.interpolate_payload_target(target, 0.1).unwrap();
+
+    for _ in 0..12 {
+        regular.step(1.0 / 240.0).unwrap();
+        deferred.step_without_diagnostics(1.0 / 240.0).unwrap();
+    }
+
+    assert_eq!(regular.positions(), deferred.positions());
+    assert_eq!(regular.velocities(), deferred.velocities());
+    assert_eq!(regular.diagnostics(), deferred.diagnostics());
+}
+
+#[test]
 fn default_simulation_remains_finite_over_time_with_recommended_substeps() {
     let mut simulation = Simulation::new(SimulationConfig::default()).unwrap();
     let outer_dt = 1.0 / 240.0;
@@ -1033,6 +1056,33 @@ fn rosenbrock_substeps_account_for_pending_rapid_payload_motion() {
     simulation.interpolate_payload_target(target, dt).unwrap();
 
     assert!(simulation.recommended_substeps(dt).unwrap() > 32);
+}
+
+#[test]
+fn backward_euler_substeps_account_for_rapid_kelvin_voigt_boundary_motion() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 64,
+        rope_model: RopeModelKind::KelvinVoigt,
+        axial_rigidity: 30_000.0,
+        axial_viscosity: 30_000.0,
+        air_damping_rate: 0.0,
+        integrator: IntegratorKind::BackwardEuler,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let target = KinematicTarget::new(
+        simulation.payload_position() + Vec2::new(-0.23, -0.02),
+        Vec2::new(-6.0, -3.0),
+    );
+    simulation.interpolate_payload_target(target, dt).unwrap();
+
+    let substeps = simulation.recommended_substeps(dt).unwrap();
+    assert!(substeps > 16);
+    for _ in 0..substeps {
+        simulation.step(dt / substeps as f64).unwrap();
+    }
+    assert!(simulation.positions().iter().all(|value| value.is_finite()));
 }
 
 #[test]
