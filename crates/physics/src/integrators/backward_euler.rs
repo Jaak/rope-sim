@@ -59,8 +59,14 @@ impl BackwardEuler {
         }
     }
 
-    fn prepare(&mut self, system: &dyn DynamicalSystem, state: &mut State, dt: f64) {
-        system.enforce_kinematics(state);
+    fn prepare(
+        &mut self,
+        system: &dyn DynamicalSystem,
+        state: &mut State,
+        dt: f64,
+        start_time: f64,
+    ) {
+        system.enforce_kinematics(state, start_time);
         self.initial.clone_from(state);
         self.trial.clone_from(state);
         self.dynamic_nodes.clear();
@@ -73,7 +79,7 @@ impl BackwardEuler {
                 self.trial.positions[index] += self.initial.velocities[index] * dt;
             }
         }
-        system.enforce_kinematics(&mut self.trial);
+        system.enforce_kinematics(&mut self.trial, start_time + dt);
 
         if self.factorized_dynamic_nodes != self.dynamic_nodes {
             self.factorized_dynamic_nodes
@@ -90,9 +96,14 @@ impl BackwardEuler {
         self.base_unknowns.resize(dimension, 0.0);
     }
 
-    fn finish(&mut self, system: &dyn DynamicalSystem, state: &mut State) -> Result<(), StepError> {
+    fn finish(
+        &mut self,
+        system: &dyn DynamicalSystem,
+        state: &mut State,
+        end_time: f64,
+    ) -> Result<(), StepError> {
         state.clone_from(&self.trial);
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, end_time);
         if state.is_finite() {
             Ok(())
         } else {
@@ -107,13 +118,15 @@ impl BackwardEuler {
         system: &dyn DynamicalSystem,
         state: &mut State,
         dt: f64,
+        start_time: f64,
     ) -> Result<(), StepError> {
         validate_timestep(dt)?;
-        self.prepare(system, state, dt);
+        self.prepare(system, state, dt, start_time);
+        let end_time = start_time + dt;
 
         if self.dynamic_nodes.is_empty() {
             system.prepare_implicit_state(&self.initial, &mut self.trial, dt);
-            return self.finish(system, state);
+            return self.finish(system, state, end_time);
         }
 
         let dimension = self.residual.len();
@@ -128,11 +141,12 @@ impl BackwardEuler {
                 dt,
                 &mut self.accelerations,
                 &mut self.residual,
+                end_time,
             );
             last_residual = infinity_norm(&self.residual);
             let scale = 1.0 + maximum_position_magnitude(&self.trial, &self.dynamic_nodes);
             if last_residual <= RESIDUAL_TOLERANCE * scale {
-                return self.finish(system, state);
+                return self.finish(system, state, end_time);
             }
 
             for index in 0..dimension {
@@ -183,6 +197,7 @@ impl BackwardEuler {
                     dt,
                     &mut self.accelerations,
                     &mut self.candidate_residual,
+                    end_time,
                 );
                 if infinity_norm(&self.candidate_residual) < last_residual {
                     accepted = true;
@@ -214,7 +229,7 @@ impl TimeIntegrator for BackwardEuler {
         dt: f64,
     ) -> Result<(), StepError> {
         validate_timestep(dt)?;
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, 0.0);
         self.backup.clone_from(state);
 
         let mut last_error = StepError::NewtonDidNotConverge {
@@ -231,8 +246,9 @@ impl TimeIntegrator for BackwardEuler {
             let substep_dt = dt / subdivision_count as f64;
             let mut succeeded = true;
 
-            for _ in 0..subdivision_count {
-                match self.solve_once(system, state, substep_dt) {
+            for subdivision in 0..subdivision_count {
+                let start_time = subdivision as f64 * substep_dt;
+                match self.solve_once(system, state, substep_dt, start_time) {
                     Ok(()) => {}
                     Err(StepError::InvalidTimeStep(invalid_dt)) => {
                         state.clone_from(&self.backup);
@@ -253,7 +269,7 @@ impl TimeIntegrator for BackwardEuler {
         }
 
         state.clone_from(&self.backup);
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, 0.0);
         Err(last_error)
     }
 
@@ -262,6 +278,7 @@ impl TimeIntegrator for BackwardEuler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_residual(
     system: &dyn DynamicalSystem,
     initial: &State,
@@ -270,11 +287,12 @@ fn evaluate_residual(
     dt: f64,
     accelerations: &mut [Vec2],
     output: &mut [f64],
+    end_time: f64,
 ) {
     for &node in dynamic_nodes {
         trial.velocities[node] = (trial.positions[node] - initial.positions[node]) / dt;
     }
-    system.enforce_kinematics(trial);
+    system.enforce_kinematics(trial, end_time);
     system.prepare_implicit_state(initial, trial, dt);
     accelerations.fill(Vec2::ZERO);
     system.accelerations(trial, accelerations);

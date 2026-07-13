@@ -57,7 +57,7 @@ impl TimeIntegrator for Rosenbrock2 {
         dt: f64,
     ) -> Result<(), StepError> {
         validate_timestep(dt)?;
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, 0.0);
         self.backup.clone_from(state);
         self.prepare(state);
 
@@ -80,7 +80,7 @@ impl TimeIntegrator for Rosenbrock2 {
         self.statistics.linear_solves += 1;
 
         self.stage.clone_from(state);
-        add_increment(system, &mut self.stage, &self.k1, 1.0);
+        add_increment(system, &mut self.stage, &self.k1, 1.0, dt);
         if !self.stage.is_finite() {
             state.clone_from(&self.backup);
             self.statistics.rejected_steps += 1;
@@ -103,8 +103,8 @@ impl TimeIntegrator for Rosenbrock2 {
         self.statistics.linear_solves += 1;
 
         self.stage.clone_from(&self.backup);
-        add_increment(system, &mut self.stage, &self.k1, 1.5);
-        add_increment(system, &mut self.stage, &self.k2, 0.5);
+        add_increment(system, &mut self.stage, &self.k1, 1.5, dt);
+        add_increment(system, &mut self.stage, &self.k2, 0.5, dt);
         if self.stage.is_finite() {
             state.clone_from(&self.stage);
             return Ok(());
@@ -176,6 +176,7 @@ fn add_increment(
     state: &mut State,
     increment: &[BlockVector],
     scale: f64,
+    stage_time: f64,
 ) {
     for (node, delta) in increment.iter().enumerate().take(state.node_count()) {
         if system.is_dynamic_node(node) {
@@ -188,5 +189,5 @@ fn add_increment(
             state.material_state[node] += scale * delta[4];
         }
     }
-    system.enforce_kinematics(state);
+    system.enforce_kinematics(state, stage_time);
 }

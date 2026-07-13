@@ -37,14 +37,14 @@ impl TimeIntegrator for RungeKutta4 {
         dt: f64,
     ) -> Result<(), StepError> {
         validate_timestep(dt)?;
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, 0.0);
 
         evaluate_derivative(system, state, &mut self.k1);
-        set_stage(system, &mut self.stage, state, &self.k1, 0.5 * dt);
+        set_stage(system, &mut self.stage, state, &self.k1, 0.5 * dt, 0.5 * dt);
         evaluate_derivative(system, &self.stage, &mut self.k2);
-        set_stage(system, &mut self.stage, state, &self.k2, 0.5 * dt);
+        set_stage(system, &mut self.stage, state, &self.k2, 0.5 * dt, 0.5 * dt);
         evaluate_derivative(system, &self.stage, &mut self.k3);
-        set_stage(system, &mut self.stage, state, &self.k3, dt);
+        set_stage(system, &mut self.stage, state, &self.k3, dt, dt);
         evaluate_derivative(system, &self.stage, &mut self.k4);
 
         let scale = dt / 6.0;
@@ -71,7 +71,7 @@ impl TimeIntegrator for RungeKutta4 {
                 * scale;
         }
 
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, dt);
         if state.is_finite() {
             Ok(())
         } else {
@@ -136,6 +136,7 @@ fn set_stage(
     initial: &State,
     derivative: &StateDerivative,
     dt: f64,
+    stage_time: f64,
 ) {
     stage.clone_from(initial);
     for node in 0..initial.node_count() {
@@ -147,5 +148,5 @@ fn set_stage(
     for element in 0..initial.material_state.len() {
         stage.material_state[element] += derivative.material_state[element] * dt;
     }
-    system.enforce_kinematics(stage);
+    system.enforce_kinematics(stage, stage_time);
 }

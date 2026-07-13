@@ -396,6 +396,52 @@ fn tr_bdf2_is_second_order_for_a_single_axial_oscillator() {
 }
 
 #[test]
+fn tr_bdf2_retains_second_order_accuracy_with_a_moving_endpoint() {
+    fn error(dt: f64) -> f64 {
+        let config = SimulationConfig {
+            segment_count: 2,
+            rope_length: 2.0,
+            rope_mass: 1.0,
+            payload_mass: 1.0,
+            axial_rigidity: 1_000.0,
+            rope_model: RopeModelKind::HookeSpring,
+            gravity: Vec2::ZERO,
+            air_damping_rate: 0.0,
+            integrator: IntegratorKind::TrBdf2,
+            ..SimulationConfig::default()
+        };
+        let mut simulation = Simulation::new(config).unwrap();
+        let duration = 0.5;
+        let boundary_speed = 0.4;
+        simulation
+            .interpolate_payload_target(
+                KinematicTarget::new(Vec2::new(0.0, -2.2), Vec2::new(0.0, -boundary_speed)),
+                duration,
+            )
+            .unwrap();
+        for _ in 0..(duration / dt).round() as usize {
+            simulation.step(dt).unwrap();
+        }
+
+        let frequency = 4_000.0_f64.sqrt();
+        let expected_position = 1.0 + 0.5 * boundary_speed * duration
+            - 0.5 * boundary_speed / frequency * (frequency * duration).sin();
+        let expected_velocity =
+            0.5 * boundary_speed - 0.5 * boundary_speed * (frequency * duration).cos();
+        let position_error = simulation.positions()[1].y + expected_position;
+        let velocity_error = simulation.velocities()[1].y + expected_velocity;
+        (position_error * position_error + velocity_error * velocity_error).sqrt()
+    }
+
+    let coarse = error(0.01);
+    let fine = error(0.005);
+    assert!(
+        coarse > 2.8 * fine,
+        "expected near-second-order moving-boundary convergence, coarse={coarse:e}, fine={fine:e}"
+    );
+}
+
+#[test]
 fn tr_bdf2_damps_an_undamped_oscillator_less_than_backward_euler() {
     fn retained_energy(integrator: IntegratorKind) -> f64 {
         let config = SimulationConfig {

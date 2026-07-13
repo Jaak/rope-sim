@@ -56,8 +56,9 @@ impl TrBdf2 {
         system: &dyn DynamicalSystem,
         state: &mut State,
         dt: f64,
+        start_time: f64,
     ) -> Result<(), StepError> {
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, start_time);
         self.initial.clone_from(state);
         let stage_dt = DIAGONAL_COEFFICIENT * dt;
 
@@ -97,6 +98,7 @@ impl TrBdf2 {
             &self.position_reference,
             &self.predictor,
             stage_dt,
+            start_time + 2.0 * stage_dt,
             &mut self.statistics,
         )?;
 
@@ -122,6 +124,7 @@ impl TrBdf2 {
             &self.position_reference,
             &self.predictor,
             stage_dt,
+            start_time + dt,
             &mut self.statistics,
         )
     }
@@ -135,7 +138,7 @@ impl TimeIntegrator for TrBdf2 {
         dt: f64,
     ) -> Result<(), StepError> {
         validate_timestep(dt)?;
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, 0.0);
         self.backup.clone_from(state);
         let mut last_error = StepError::NewtonDidNotConverge {
             iterations: 0,
@@ -150,8 +153,9 @@ impl TimeIntegrator for TrBdf2 {
             let subdivisions = 1_usize << retry_level;
             let substep_dt = dt / subdivisions as f64;
             let mut succeeded = true;
-            for _ in 0..subdivisions {
-                if let Err(error) = self.solve_once(system, state, substep_dt) {
+            for subdivision in 0..subdivisions {
+                let start_time = subdivision as f64 * substep_dt;
+                if let Err(error) = self.solve_once(system, state, substep_dt, start_time) {
                     self.statistics.rejected_steps += 1;
                     last_error = error;
                     succeeded = false;
@@ -164,7 +168,7 @@ impl TimeIntegrator for TrBdf2 {
         }
 
         state.clone_from(&self.backup);
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, 0.0);
         Err(last_error)
     }
 
@@ -229,6 +233,7 @@ impl StageSolver {
         position_reference: &[Vec2],
         predictor: &[Vec2],
         dt: f64,
+        stage_time: f64,
         statistics: &mut IntegratorStatistics,
     ) -> Result<(), StepError> {
         self.trial.clone_from(output);
@@ -243,7 +248,7 @@ impl StageSolver {
                 self.trial.positions[node] = predicted_position;
             }
         }
-        system.enforce_kinematics(&mut self.trial);
+        system.enforce_kinematics(&mut self.trial, stage_time);
 
         if self.factorized_dynamic_nodes != self.dynamic_nodes {
             self.factorized_dynamic_nodes
@@ -277,6 +282,7 @@ impl StageSolver {
                 dt,
                 &mut self.accelerations,
                 &mut self.residual,
+                stage_time,
             );
             last_residual = infinity_norm(&self.residual);
             let scale = 1.0 + maximum_position_magnitude(&self.trial, &self.dynamic_nodes);
@@ -345,6 +351,7 @@ impl StageSolver {
                     dt,
                     &mut self.accelerations,
                     &mut self.candidate_residual,
+                    stage_time,
                 );
                 if infinity_norm(&self.candidate_residual) < last_residual {
                     accepted = true;
@@ -378,11 +385,12 @@ fn evaluate_residual(
     dt: f64,
     accelerations: &mut [Vec2],
     output: &mut [f64],
+    stage_time: f64,
 ) {
     for &node in dynamic_nodes {
         trial.velocities[node] = (trial.positions[node] - position_reference[node]) / dt;
     }
-    system.enforce_kinematics(trial);
+    system.enforce_kinematics(trial, stage_time);
     system.prepare_implicit_state(material_base, trial, dt);
     accelerations.fill(Vec2::ZERO);
     system.accelerations(trial, accelerations);

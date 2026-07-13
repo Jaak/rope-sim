@@ -56,8 +56,9 @@ pub(crate) trait DynamicalSystem {
     /// Return whether the integrator should advance this node.
     fn is_dynamic_node(&self, index: usize) -> bool;
 
-    /// Reapply fixed and prescribed state after an integration stage.
-    fn enforce_kinematics(&self, state: &mut State);
+    /// Reapply fixed and prescribed state at a stage time measured from the
+    /// beginning of the current integration step.
+    fn enforce_kinematics(&self, state: &mut State, stage_time: f64);
 
     /// Conservative stability limit for explicit integration of this system.
     fn explicit_stable_timestep(&self) -> f64;

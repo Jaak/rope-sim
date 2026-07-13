@@ -26,7 +26,7 @@ impl TimeIntegrator for SemiImplicitEuler {
     ) -> Result<(), StepError> {
         validate_timestep(dt)?;
 
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, 0.0);
         self.accelerations.resize(state.node_count(), Vec2::ZERO);
         self.accelerations.fill(Vec2::ZERO);
         system.accelerations(state, &mut self.accelerations);
@@ -51,7 +51,7 @@ impl TimeIntegrator for SemiImplicitEuler {
             state.positions[index] += state.velocities[index] * dt;
         }
 
-        system.enforce_kinematics(state);
+        system.enforce_kinematics(state, dt);
         if !state.is_finite() {
             return Err(StepError::NonFiniteState);
         }

@@ -1,7 +1,7 @@
 use crate::config::{ConfigError, SimulationConfig};
 use crate::dynamics::RopeDynamics;
 use crate::integrators::{DynamicalSystem, StepError, TimeIntegrator, create_integrator};
-use crate::kinematics::KinematicTarget;
+use crate::kinematics::{KinematicMotion, KinematicTarget};
 use crate::materials::AxialMaterial;
 use crate::math::Vec2;
 use crate::state::State;
@@ -114,6 +114,7 @@ impl Simulation {
             &self.masses,
             self.rest_length,
             self.payload_target,
+            self.payload_motion,
             self.kinematic_speed(),
         );
         self.integrator.recommended_substeps(&system, outer_dt)
@@ -165,7 +166,7 @@ impl Simulation {
         }
     }
 
-    /// Move a held payload to a new target along a smooth prescribed trajectory.
+    /// Move a held payload to a new target along a bounded linear trajectory.
     ///
     /// The trajectory is sampled by each physics substep, avoiding the
     /// render-frame position jumps that would otherwise excite high-frequency
@@ -194,15 +195,16 @@ impl Simulation {
     }
 
     pub fn step(&mut self, dt: f64) -> Result<Diagnostics, StepError> {
-        self.advance_payload_motion(dt);
         let system = RopeDynamics::new(
             &self.config,
             &self.masses,
             self.rest_length,
             self.payload_target,
+            self.payload_motion,
             self.kinematic_speed(),
         );
         self.integrator.step(&system, &mut self.state, dt)?;
+        self.advance_payload_motion(dt);
         self.cumulative_prescribed_work += self.prescribed_endpoint_power() * dt;
         self.time += dt;
         Ok(self.diagnostics())
@@ -251,6 +253,7 @@ impl Simulation {
             &self.masses,
             self.rest_length,
             self.payload_target,
+            self.payload_motion,
             self.kinematic_speed(),
         );
         let statistics = self.integrator.statistics();
@@ -336,45 +339,5 @@ impl Simulation {
         self.payload_motion.map_or(target_speed, |motion| {
             target_speed.max(motion.maximum_speed())
         })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct KinematicMotion {
-    start: KinematicTarget,
-    end: KinematicTarget,
-    duration: f64,
-    elapsed: f64,
-}
-
-impl KinematicMotion {
-    fn new(start: KinematicTarget, end: KinematicTarget, duration: f64) -> Self {
-        Self {
-            start,
-            end,
-            duration,
-            elapsed: 0.0,
-        }
-    }
-
-    fn advance(&mut self, dt: f64) -> (KinematicTarget, bool) {
-        self.elapsed = (self.elapsed + dt).min(self.duration);
-        let u = self.elapsed / self.duration;
-        let displacement = self.end.position - self.start.position;
-        let position = self.start.position + displacement * u;
-        let finished = self.elapsed >= self.duration;
-        let velocity = if finished {
-            self.end.velocity
-        } else {
-            displacement / self.duration
-        };
-
-        (KinematicTarget::new(position, velocity), finished)
-    }
-
-    fn maximum_speed(self) -> f64 {
-        ((self.end.position - self.start.position) / self.duration)
-            .length()
-            .max(self.end.velocity.length())
     }
 }

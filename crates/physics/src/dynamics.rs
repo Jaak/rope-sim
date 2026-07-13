@@ -3,7 +3,7 @@ mod element;
 use crate::config::SimulationConfig;
 use crate::integrators::block_tridiagonal::BlockTridiagonalMatrix;
 use crate::integrators::{AccelerationJacobianBlock, DynamicalSystem};
-use crate::kinematics::KinematicTarget;
+use crate::kinematics::{KinematicMotion, KinematicTarget};
 use crate::materials::{AxialKinematics, AxialMaterial, AxialResponse};
 use crate::math::Vec2;
 use crate::state::State;
@@ -20,6 +20,7 @@ pub(crate) struct RopeDynamics<'a> {
     masses: &'a [f64],
     rest_length: f64,
     payload_target: Option<KinematicTarget>,
+    payload_motion: Option<KinematicMotion>,
     kinematic_speed: f64,
     material: AxialMaterial,
 }
@@ -30,6 +31,7 @@ impl<'a> RopeDynamics<'a> {
         masses: &'a [f64],
         rest_length: f64,
         payload_target: Option<KinematicTarget>,
+        payload_motion: Option<KinematicMotion>,
         kinematic_speed: f64,
     ) -> Self {
         Self {
@@ -37,6 +39,7 @@ impl<'a> RopeDynamics<'a> {
             masses,
             rest_length,
             payload_target,
+            payload_motion,
             kinematic_speed,
             material: AxialMaterial::from_config(*config),
         }
@@ -44,6 +47,12 @@ impl<'a> RopeDynamics<'a> {
 
     fn payload_index(&self) -> usize {
         self.masses.len() - 1
+    }
+
+    fn payload_target_at(&self, stage_time: f64) -> Option<KinematicTarget> {
+        self.payload_motion
+            .map(|motion| motion.target_after(stage_time))
+            .or(self.payload_target)
     }
 
     fn assemble_acceleration_jacobian(
@@ -348,11 +357,11 @@ impl DynamicalSystem for RopeDynamics<'_> {
         index != 0 && !(index == self.payload_index() && self.payload_target.is_some())
     }
 
-    fn enforce_kinematics(&self, state: &mut State) {
+    fn enforce_kinematics(&self, state: &mut State, stage_time: f64) {
         state.positions[0] = self.config.anchor;
         state.velocities[0] = Vec2::ZERO;
 
-        if let Some(target) = self.payload_target {
+        if let Some(target) = self.payload_target_at(stage_time) {
             let index = self.payload_index();
             state.positions[index] = target.position;
             state.velocities[index] = target.velocity;
@@ -476,7 +485,7 @@ mod tests {
             Vec2::new(0.2, 0.5),
         ];
 
-        let system = RopeDynamics::new(&config, &masses, rest_length, None, 0.0);
+        let system = RopeDynamics::new(&config, &masses, rest_length, None, None, 0.0);
         let mut blocks = Vec::new();
         system.acceleration_jacobian(&state, &mut blocks);
 
@@ -544,7 +553,7 @@ mod tests {
         let mut initial = test_state();
         initial.material_state = vec![120.0, -35.0, 80.0];
 
-        let system = RopeDynamics::new(&config, &masses, rest_length, None, 0.0);
+        let system = RopeDynamics::new(&config, &masses, rest_length, None, None, 0.0);
         let dt = 0.01;
         let trial_velocities = [
             Vec2::ZERO,
@@ -632,7 +641,7 @@ mod tests {
         ];
         state.material_state = vec![120.0, -35.0, 80.0];
 
-        let system = RopeDynamics::new(&config, &masses, rest_length, None, 0.0);
+        let system = RopeDynamics::new(&config, &masses, rest_length, None, None, 0.0);
         let mut jacobian = BlockTridiagonalMatrix::new(state.node_count());
         system.first_order_jacobian(&state, &mut jacobian);
 
