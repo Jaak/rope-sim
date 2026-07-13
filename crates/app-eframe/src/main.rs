@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -20,6 +21,9 @@ const MAX_STEPS_PER_FRAME: usize = 32;
 const PAYLOAD_RADIUS: f32 = 13.0;
 const GRAB_RADIUS: f32 = 24.0;
 const SCENARIO_DIRECTORY: &str = "scenarios";
+const PERFORMANCE_SMOOTHING_SECONDS: f64 = 0.5;
+const TAIL_FPS_WINDOW_SECONDS: f64 = 5.0;
+const TAIL_FPS_REFRESH_SECONDS: f64 = 0.25;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -46,6 +50,7 @@ struct RopeSimApp {
     time_scale: f64,
     integration_substeps: usize,
     last_frame: Instant,
+    performance: PerformanceMetrics,
     dragging_payload: bool,
     viewport_id: Option<egui::Id>,
     previous_drag_position: Option<Vec2>,
@@ -76,6 +81,7 @@ impl RopeSimApp {
             time_scale: 1.0,
             integration_substeps,
             last_frame: Instant::now(),
+            performance: PerformanceMetrics::default(),
             dragging_payload: false,
             viewport_id: None,
             previous_drag_position: None,
@@ -318,85 +324,145 @@ impl RopeSimApp {
 
                         ui.separator();
                         ui.heading("Diagnostics");
-                        egui::Grid::new("diagnostics_grid")
+                        egui::Grid::new("performance_diagnostics_grid")
                             .num_columns(2)
                             .spacing([12.0, 3.0])
                             .show(ui, |ui| {
-                                diagnostic_row(ui, "Time", self.diagnostics.simulation_time, "s");
-                                diagnostic_row(ui, "Kinetic", self.diagnostics.kinetic_energy, "J");
-                                diagnostic_row(ui, "Elastic", self.diagnostics.elastic_energy, "J");
                                 diagnostic_row(
                                     ui,
-                                    "Gravity",
-                                    self.diagnostics.gravitational_energy,
-                                    "J",
+                                    "Frame rate",
+                                    self.performance.frames_per_second(),
+                                    "FPS",
                                 );
                                 diagnostic_row(
                                     ui,
-                                    "Total",
-                                    self.diagnostics.total_mechanical_energy,
-                                    "J",
+                                    "1% low",
+                                    self.performance.one_percent_low_fps(),
+                                    "FPS",
                                 );
                                 diagnostic_row(
                                     ui,
-                                    "Max tension strain",
-                                    100.0 * self.diagnostics.maximum_tensile_strain,
+                                    "Physics time",
+                                    self.performance.physics_time_ms(),
+                                    "ms/frame",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Physics load",
+                                    self.performance.physics_load_percent(),
                                     "%",
                                 );
                                 diagnostic_row(
                                     ui,
-                                    "Min segment",
-                                    self.diagnostics.minimum_segment_length,
-                                    "m",
+                                    "Simulation rate",
+                                    self.performance.simulation_rate(),
+                                    "x real time",
                                 );
-                                diagnostic_row(
-                                    ui,
-                                    "Max speed",
-                                    self.diagnostics.maximum_node_speed,
-                                    "m/s",
-                                );
-                                diagnostic_row(
-                                    ui,
-                                    "Endpoint power",
-                                    self.diagnostics.prescribed_endpoint_power,
-                                    "W",
-                                );
-                                diagnostic_row(
-                                    ui,
-                                    "Endpoint work",
-                                    self.diagnostics.cumulative_prescribed_work,
-                                    "J",
-                                );
-                                diagnostic_row(
-                                    ui,
-                                    "Rejected steps",
-                                    self.diagnostics.rejected_steps as f64,
-                                    "",
-                                );
-                                diagnostic_row(
-                                    ui,
-                                    "Linear solves",
-                                    self.diagnostics.linear_solves as f64,
-                                    "",
-                                );
-                                diagnostic_row(
-                                    ui,
-                                    "Newton iterations",
-                                    self.diagnostics.nonlinear_iterations as f64,
-                                    "",
-                                );
-                                diagnostic_row(
-                                    ui,
-                                    "Adaptive retries",
-                                    self.diagnostics.adaptive_retries as f64,
-                                    "",
-                                );
-                                diagnostic_row(
-                                    ui,
-                                    "Timestep",
-                                    self.diagnostics.explicit_stable_timestep * 1000.0,
-                                    "ms",
-                                );
+                                diagnostic_row(ui, "Time", self.diagnostics.simulation_time, "s");
+                            });
+
+                        egui::CollapsingHeader::new("Physical state")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("physical_diagnostics_grid")
+                                    .num_columns(2)
+                                    .spacing([12.0, 3.0])
+                                    .show(ui, |ui| {
+                                        diagnostic_row(
+                                            ui,
+                                            "Kinetic",
+                                            self.diagnostics.kinetic_energy,
+                                            "J",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Elastic",
+                                            self.diagnostics.elastic_energy,
+                                            "J",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Gravity",
+                                            self.diagnostics.gravitational_energy,
+                                            "J",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Total",
+                                            self.diagnostics.total_mechanical_energy,
+                                            "J",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Max tension strain",
+                                            100.0 * self.diagnostics.maximum_tensile_strain,
+                                            "%",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Min segment",
+                                            self.diagnostics.minimum_segment_length,
+                                            "m",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Max speed",
+                                            self.diagnostics.maximum_node_speed,
+                                            "m/s",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Endpoint power",
+                                            self.diagnostics.prescribed_endpoint_power,
+                                            "W",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Endpoint work",
+                                            self.diagnostics.cumulative_prescribed_work,
+                                            "J",
+                                        );
+                                    });
+                            });
+
+                        egui::CollapsingHeader::new("Solver details")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("solver_diagnostics_grid")
+                                    .num_columns(2)
+                                    .spacing([12.0, 3.0])
+                                    .show(ui, |ui| {
+                                        diagnostic_row(
+                                            ui,
+                                            "Rejected steps",
+                                            self.diagnostics.rejected_steps as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Linear solves",
+                                            self.diagnostics.linear_solves as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Newton iterations",
+                                            self.diagnostics.nonlinear_iterations as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Adaptive retries",
+                                            self.diagnostics.adaptive_retries as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Timestep",
+                                            self.diagnostics.explicit_stable_timestep * 1000.0,
+                                            "ms",
+                                        );
+                                    });
                             });
 
                         ui.add_space(8.0);
@@ -512,7 +578,14 @@ impl RopeSimApp {
             let transform = ViewTransform::new(response.rect, self.config);
 
             self.update_drag(&response, transform, frame_dt);
+            let simulation_time_before = self.diagnostics.simulation_time;
+            let physics_start = Instant::now();
             self.advance_simulation(frame_dt);
+            self.performance.observe_physics(
+                physics_start.elapsed().as_secs_f64(),
+                frame_dt,
+                (self.diagnostics.simulation_time - simulation_time_before).max(0.0),
+            );
             self.paint_scene(&painter, response.rect, transform);
         });
     }
@@ -627,8 +700,8 @@ impl RopeSimApp {
 
             let mut failed = None;
             for _ in 0..self.integration_substeps {
-                match self.simulation.step(substep_dt) {
-                    Ok(diagnostics) => self.diagnostics = diagnostics,
+                match self.simulation.step_without_diagnostics(substep_dt) {
+                    Ok(()) => {}
                     Err(error) => {
                         failed = Some(error.to_string());
                         break;
@@ -640,6 +713,7 @@ impl RopeSimApp {
                 return;
             }
 
+            self.diagnostics = self.simulation.diagnostics();
             self.error_message = None;
             self.accumulator -= DEFAULT_FIXED_DT;
             steps += 1;
@@ -847,7 +921,14 @@ impl RopeSimApp {
     }
 
     fn recover_from_step_error(&mut self, error: String) {
-        self.stop_scenario_activity();
+        let post_failure_duration = if self.scenarios.is_recording() {
+            DEFAULT_FIXED_DT
+        } else {
+            0.0
+        };
+        self.scenarios
+            .stop(self.diagnostics.simulation_time + post_failure_duration);
+        self.scenario_status = None;
         self.simulation =
             Simulation::new(self.config).expect("slider-constrained configuration must be valid");
         self.after_simulation_reset();
@@ -863,11 +944,113 @@ impl eframe::App for RopeSimApp {
         let now = Instant::now();
         let frame_dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
+        self.performance.observe_frame(frame_dt);
 
         self.handle_keyboard_shortcuts(ui.ctx());
         self.controls(ui);
         self.viewport(ui, frame_dt);
         ui.ctx().request_repaint();
+    }
+}
+
+#[derive(Default)]
+struct PerformanceMetrics {
+    frame_interval: Option<f64>,
+    physics_time: Option<f64>,
+    simulation_rate: Option<f64>,
+    frame_intervals: VecDeque<f64>,
+    frame_window_duration: f64,
+    tail_refresh_elapsed: f64,
+    one_percent_low_fps: f64,
+}
+
+impl PerformanceMetrics {
+    fn observe_frame(&mut self, frame_interval: f64) {
+        if !frame_interval.is_finite() || frame_interval <= 0.0 {
+            return;
+        }
+        update_smoothed_value(&mut self.frame_interval, frame_interval, frame_interval);
+        self.frame_intervals.push_back(frame_interval);
+        self.frame_window_duration += frame_interval;
+        while self.frame_intervals.len() > 1
+            && self.frame_window_duration
+                - self
+                    .frame_intervals
+                    .front()
+                    .copied()
+                    .expect("a nonempty frame window has a first sample")
+                >= TAIL_FPS_WINDOW_SECONDS
+        {
+            self.frame_window_duration -= self
+                .frame_intervals
+                .pop_front()
+                .expect("a nonempty frame window can remove its first sample");
+        }
+
+        self.tail_refresh_elapsed += frame_interval;
+        if self.one_percent_low_fps == 0.0 || self.tail_refresh_elapsed >= TAIL_FPS_REFRESH_SECONDS
+        {
+            self.refresh_one_percent_low_fps();
+            self.tail_refresh_elapsed = 0.0;
+        }
+    }
+
+    fn observe_physics(&mut self, physics_time: f64, frame_interval: f64, simulation_advance: f64) {
+        update_smoothed_value(&mut self.physics_time, physics_time, frame_interval);
+        update_smoothed_value(
+            &mut self.simulation_rate,
+            simulation_advance / frame_interval,
+            frame_interval,
+        );
+    }
+
+    fn frames_per_second(&self) -> f64 {
+        self.frame_interval
+            .filter(|interval| *interval > 0.0)
+            .map_or(0.0, |interval| interval.recip())
+    }
+
+    fn one_percent_low_fps(&self) -> f64 {
+        self.one_percent_low_fps
+    }
+
+    fn physics_time_ms(&self) -> f64 {
+        1000.0 * self.physics_time.unwrap_or(0.0)
+    }
+
+    fn physics_load_percent(&self) -> f64 {
+        match (self.physics_time, self.frame_interval) {
+            (Some(physics_time), Some(frame_interval)) if frame_interval > 0.0 => {
+                100.0 * physics_time / frame_interval
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn simulation_rate(&self) -> f64 {
+        self.simulation_rate.unwrap_or(0.0)
+    }
+
+    fn refresh_one_percent_low_fps(&mut self) {
+        let mut intervals: Vec<_> = self.frame_intervals.iter().copied().collect();
+        intervals.sort_by(|left, right| right.total_cmp(left));
+        let tail_count = ((intervals.len() as f64 * 0.01).ceil() as usize).max(1);
+        let mean_tail_interval = intervals[..tail_count].iter().sum::<f64>() / tail_count as f64;
+        self.one_percent_low_fps = mean_tail_interval.recip();
+    }
+}
+
+fn update_smoothed_value(value: &mut Option<f64>, sample: f64, sample_interval: f64) {
+    if !sample.is_finite() || sample < 0.0 || !sample_interval.is_finite() || sample_interval <= 0.0
+    {
+        return;
+    }
+
+    if let Some(previous) = value {
+        let weight = 1.0 - (-sample_interval / PERFORMANCE_SMOOTHING_SECONDS).exp();
+        *previous += weight * (sample - *previous);
+    } else {
+        *value = Some(sample);
     }
 }
 
@@ -953,7 +1136,31 @@ fn paint_dotted_circle(painter: &egui::Painter, center: Pos2, radius: f32, color
 mod tests {
     use std::path::PathBuf;
 
-    use super::{format_diagnostic, scenario_path};
+    use super::{PerformanceMetrics, format_diagnostic, scenario_path};
+
+    #[test]
+    fn performance_metrics_report_frame_and_simulation_throughput() {
+        let mut metrics = PerformanceMetrics::default();
+        metrics.observe_frame(1.0 / 60.0);
+        metrics.observe_physics(0.004, 1.0 / 60.0, 1.0 / 60.0);
+
+        assert!((metrics.frames_per_second() - 60.0).abs() < 1.0e-12);
+        assert!((metrics.one_percent_low_fps() - 60.0).abs() < 1.0e-12);
+        assert!((metrics.physics_time_ms() - 4.0).abs() < 1.0e-12);
+        assert!((metrics.physics_load_percent() - 24.0).abs() < 1.0e-12);
+        assert!((metrics.simulation_rate() - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn one_percent_low_fps_retains_slow_frames() {
+        let mut metrics = PerformanceMetrics::default();
+        for _ in 0..99 {
+            metrics.observe_frame(0.01);
+        }
+        metrics.observe_frame(0.1);
+
+        assert!((metrics.one_percent_low_fps() - 10.0).abs() < 1.0e-12);
+    }
 
     #[test]
     fn huge_diagnostics_use_bounded_scientific_notation() {
