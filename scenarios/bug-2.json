@@ -1,0 +1,78 @@
+{
+  "format_version": 1,
+  "config": {
+    "segment_count": 64,
+    "rope_length": 12.0,
+    "rope_mass": 0.9,
+    "payload_mass": 80.0,
+    "axial_rigidity": 30000.0,
+    "transient_axial_rigidity": 15000.0,
+    "rope_model": "kelvin_voigt",
+    "axial_viscosity": 20000.0,
+    "air_damping_rate": 0.0,
+    "gravity": {
+      "x": 0.0,
+      "y": -9.81
+    },
+    "anchor": {
+      "x": 0.0,
+      "y": 0.0
+    },
+    "integrator": "tr_bdf2"
+  },
+  "fixed_time_step": 0.004166666666666667,
+  "duration": 2.041666666666667,
+  "test_integrators": [
+    "backward_euler",
+    "tr_bdf2"
+  ],
+  "commands": [
+    {
+      "time": 1.2791666666666635,
+      "command": {
+        "interpolate_target": {
+          "target": {
+            "position": {
+              "x": -0.14589472115039825,
+              "y": -11.984210014343262
+            },
+            "velocity": {
+              "x": 0.0,
+              "y": 0.0
+            }
+          },
+          "duration": 0.004166666666666667
+        }
+      }
+    },
+    {
+      "time": 1.2833333333333299,
+      "command": {
+        "interpolate_target": {
+          "target": {
+            "position": {
+              "x": -0.06252630800008774,
+              "y": -11.400630950927734
+            },
+            "velocity": {
+              "x": 2.2282546101090337,
+              "y": 15.597786850929372
+            }
+          },
+          "duration": 0.0168364
+        }
+      }
+    },
+    {
+      "time": 1.300000000000001,
+      "command": {
+        "release": {
+          "velocity": {
+            "x": 4.951676911353408,
+            "y": 34.661748557620825
+          }
+        }
+      }
+    }
+  ]
+}
