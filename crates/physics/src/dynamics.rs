@@ -13,7 +13,6 @@ use element::{extension_rate, force_jacobians, kinematics, scalar_jacobians};
 const POSITION_OFFSET: usize = 0;
 const VELOCITY_OFFSET: usize = 2;
 const MATERIAL_COMPONENT: usize = 4;
-const MAX_KINEMATIC_TRAVEL_FRACTION: f64 = 0.1;
 
 pub(crate) struct RopeDynamics<'a> {
     config: &'a SimulationConfig,
@@ -368,12 +367,12 @@ impl DynamicalSystem for RopeDynamics<'_> {
         }
     }
 
-    fn explicit_stable_timestep(&self) -> f64 {
+    fn explicit_stable_timestep(&self, state: &State) -> f64 {
         let minimum_dynamic_mass = self.masses[1..]
             .iter()
             .copied()
             .fold(f64::INFINITY, f64::min);
-        let spring_limited_dt = self.elastic_stable_timestep();
+        let spring_limited_dt = self.elastic_stable_timestep(state);
 
         let element_damping = self.material.explicit_viscosity() / self.rest_length;
         let maximum_damping_rate =
@@ -396,12 +395,25 @@ impl DynamicalSystem for RopeDynamics<'_> {
             .min(relaxation_limited_dt)
     }
 
-    fn elastic_stable_timestep(&self) -> f64 {
+    fn elastic_stable_timestep(&self, state: &State) -> f64 {
         let minimum_dynamic_mass = self.masses[1..]
             .iter()
             .copied()
             .fold(f64::INFINITY, f64::min);
-        let element_stiffness = self.material.instantaneous_rigidity() / self.rest_length;
+        let maximum_tangent_rigidity = (0..self.config.segment_count)
+            .map(|left| {
+                let axial = kinematics(state, left, self.rest_length).map_or(
+                    AxialKinematics {
+                        extension: -self.rest_length,
+                        extension_rate: 0.0,
+                    },
+                    |kinematics| kinematics.axial,
+                );
+                self.material
+                    .instantaneous_tangent_rigidity(axial, self.rest_length)
+            })
+            .fold(0.0_f64, f64::max);
+        let element_stiffness = maximum_tangent_rigidity / self.rest_length;
         0.8 * (minimum_dynamic_mass / element_stiffness).sqrt()
     }
 
@@ -411,7 +423,8 @@ impl DynamicalSystem for RopeDynamics<'_> {
 
     fn kinematic_timestep_limit(&self) -> f64 {
         if self.payload_target.is_some() && self.kinematic_speed > 0.0 {
-            MAX_KINEMATIC_TRAVEL_FRACTION * self.rest_length / self.kinematic_speed
+            self.material.maximum_kinematic_travel_fraction() * self.rest_length
+                / self.kinematic_speed
         } else {
             f64::INFINITY
         }
@@ -469,9 +482,18 @@ mod tests {
 
     #[test]
     fn analytic_acceleration_jacobian_matches_central_differences() {
+        for rope_model in [
+            RopeModelKind::KelvinVoigt,
+            RopeModelKind::QuadraticKelvinVoigt,
+        ] {
+            assert_acceleration_jacobian_matches_central_differences(rope_model);
+        }
+    }
+
+    fn assert_acceleration_jacobian_matches_central_differences(rope_model: RopeModelKind) {
         let config = SimulationConfig {
             segment_count: 3,
-            rope_model: RopeModelKind::KelvinVoigt,
+            rope_model,
             axial_viscosity: 7.0,
             ..SimulationConfig::default()
         };
@@ -506,7 +528,9 @@ mod tests {
                         analytic[block.row_node].y += matrix[1][column_component];
                     }
 
-                    let step = 1.0e-6;
+                    // Acceleration magnitudes are large enough that a 1e-6
+                    // perturbation loses several digits to cancellation.
+                    let step = 1.0e-5;
                     let mut plus = state.clone();
                     let mut minus = state.clone();
                     let plus_value = if position_derivative {

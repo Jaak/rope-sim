@@ -14,7 +14,7 @@ use crate::state::State;
 
 use block_tridiagonal::BlockTridiagonalMatrix;
 
-use backward_euler::BackwardEuler;
+pub(crate) use backward_euler::{BackwardEuler, PredictorCorrection};
 use rk4::RungeKutta4;
 use rosenbrock::Rosenbrock2;
 use semi_implicit_euler::SemiImplicitEuler;
@@ -62,11 +62,11 @@ pub(crate) trait DynamicalSystem {
     fn enforce_kinematics(&self, state: &mut State, stage_time: f64);
 
     /// Conservative stability limit for explicit integration of this system.
-    fn explicit_stable_timestep(&self) -> f64;
+    fn explicit_stable_timestep(&self, state: &State) -> f64;
 
     /// Conservative elastic timescale, excluding viscous and constitutive
     /// relaxation restrictions that a linearly implicit method handles directly.
-    fn elastic_stable_timestep(&self) -> f64;
+    fn elastic_stable_timestep(&self, state: &State) -> f64;
 
     /// Whether an endpoint is currently following a prescribed trajectory.
     fn has_kinematic_target(&self) -> bool;
@@ -87,6 +87,7 @@ pub(crate) trait TimeIntegrator {
     fn recommended_substeps(
         &self,
         _system: &dyn DynamicalSystem,
+        _state: &State,
         outer_dt: f64,
     ) -> Result<usize, StepError> {
         validate_timestep(outer_dt)?;
@@ -104,16 +105,21 @@ pub(crate) struct IntegratorStatistics {
     pub linear_solves: u64,
     pub nonlinear_iterations: u64,
     pub adaptive_retries: u64,
+    pub residual_evaluations: u64,
+    pub jacobian_assemblies: u64,
+    pub block_factorizations: u64,
+    pub sparse_factorizations: u64,
+    pub line_search_backtracks: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegratorKind {
-    #[default]
     SemiImplicitEuler,
     RungeKutta4,
     Rosenbrock2,
     TrBdf2,
+    #[default]
     BackwardEuler,
 }
 

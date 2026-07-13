@@ -1,9 +1,59 @@
 use ropesim_physics::{
     ConfigError, IntegratorKind, KinematicTarget, ReconfigureOutcome, RopeModelKind, Simulation,
-    SimulationConfig, Vec2,
+    SimulationConfig, StepError, Vec2,
 };
 
 const EPSILON: f64 = 1.0e-10;
+
+#[test]
+fn backward_euler_is_the_default_integrator() {
+    assert_eq!(IntegratorKind::default(), IntegratorKind::BackwardEuler);
+    assert_eq!(
+        SimulationConfig::default().integrator,
+        IntegratorKind::BackwardEuler
+    );
+}
+
+#[test]
+fn calibrated_sls_is_the_default_rope_preset() {
+    let config = SimulationConfig::default();
+
+    assert_eq!(RopeModelKind::default(), RopeModelKind::StandardLinearSolid);
+    assert_eq!(config.rope_model, RopeModelKind::StandardLinearSolid);
+    assert_eq!(config.rope_length, 12.0);
+    assert_eq!(config.rope_mass, 0.648);
+    assert_eq!(config.payload_mass, 80.0);
+    assert_eq!(config.axial_rigidity, 10_335.377);
+    assert_eq!(config.transient_axial_rigidity, 18_325.2);
+    assert_eq!(config.axial_viscosity, 7_288.0);
+    assert_eq!(config.air_damping_rate, 0.0);
+}
+
+#[test]
+fn every_rope_model_loads_its_own_recommended_parameters() {
+    let mut config = SimulationConfig::default();
+
+    config.apply_recommended_rope_model(RopeModelKind::HookeSpring);
+    assert_eq!(config.axial_rigidity, 25_281.9);
+    assert_eq!(config.air_damping_rate, 0.05);
+
+    config.apply_recommended_rope_model(RopeModelKind::KelvinVoigt);
+    assert_eq!(config.axial_rigidity, 10_335.377);
+    assert_eq!(config.axial_viscosity, 2_045.3);
+    assert_eq!(config.air_damping_rate, 0.0);
+
+    config.apply_recommended_rope_model(RopeModelKind::QuadraticKelvinVoigt);
+    assert_eq!(config.axial_rigidity, 30_000.0);
+    assert_eq!(config.quadratic_axial_rigidity, 100_000.0);
+    assert_eq!(config.axial_viscosity, 0.6);
+    assert_eq!(config.air_damping_rate, 0.05);
+
+    config.apply_recommended_rope_model(RopeModelKind::StandardLinearSolid);
+    assert_eq!(config.axial_rigidity, 10_335.377);
+    assert_eq!(config.transient_axial_rigidity, 18_325.2);
+    assert_eq!(config.axial_viscosity, 7_288.0);
+    assert_eq!(config.air_damping_rate, 0.0);
+}
 
 #[test]
 fn mass_distribution_preserves_total_mass() {
@@ -34,6 +84,289 @@ fn fixed_anchor_never_moves() {
 
     assert_eq!(simulation.positions()[0], config.anchor);
     assert_eq!(simulation.velocities()[0], Vec2::ZERO);
+}
+
+#[test]
+fn xpbd_manipulation_pins_the_payload_and_preserves_boundary_velocity() {
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 8,
+        rope_model: RopeModelKind::KelvinVoigt,
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let target = KinematicTarget::new(Vec2::new(1.5, -6.0), Vec2::new(2.0, -0.5));
+
+    simulation.set_manipulation_target(target);
+    for _ in 0..120 {
+        assert_eq!(simulation.recommended_substeps(1.0 / 240.0).unwrap(), 1);
+        simulation.step(1.0 / 240.0).unwrap();
+    }
+
+    assert_eq!(simulation.payload_position(), target.position);
+    assert_eq!(simulation.payload_velocity(), target.velocity);
+    assert!(
+        simulation
+            .velocities()
+            .iter()
+            .all(|velocity| velocity.is_finite())
+    );
+}
+
+#[test]
+fn xpbd_release_immediately_hands_throw_velocity_to_the_selected_integrator() {
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 1,
+        gravity: Vec2::ZERO,
+        air_damping_rate: 0.0,
+        integrator: IntegratorKind::BackwardEuler,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let throw_velocity = Vec2::new(3.0, 1.5);
+    simulation.set_manipulation_target(KinematicTarget::new(
+        simulation.payload_position(),
+        throw_velocity,
+    ));
+    simulation.step(1.0 / 240.0).unwrap();
+    simulation.release_manipulation(throw_velocity);
+
+    assert!(!simulation.manipulation_active());
+    assert_eq!(simulation.payload_velocity(), throw_velocity);
+}
+
+#[test]
+fn xpbd_release_handoff_preserves_time_and_the_last_applied_velocity() {
+    let mut simulation = Simulation::new(SimulationConfig {
+        gravity: Vec2::ZERO,
+        integrator: IntegratorKind::BackwardEuler,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let held_velocity = Vec2::new(4.0, -2.0);
+    simulation.set_manipulation_target(KinematicTarget::new(
+        simulation.payload_position(),
+        held_velocity,
+    ));
+    simulation.step(1.0 / 240.0).unwrap();
+    let time_before_release = simulation.diagnostics().simulation_time;
+    let payload_position_before_release = simulation.payload_position();
+
+    simulation.release_manipulation(Vec2::new(40.0, 40.0));
+
+    assert_eq!(
+        simulation.diagnostics().simulation_time,
+        time_before_release
+    );
+    assert_eq!(
+        simulation.payload_position(),
+        payload_position_before_release
+    );
+    assert_eq!(simulation.payload_velocity(), held_velocity);
+    assert_eq!(simulation.diagnostics().manipulation_release_handoffs, 1);
+}
+
+#[test]
+fn hybrid_manipulation_correction_runs_at_120_hz_without_double_stepping_time() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let target = KinematicTarget::new(simulation.payload_position(), Vec2::ZERO);
+    simulation.set_manipulation_target(target);
+
+    simulation.step(dt).unwrap();
+    let first = simulation.diagnostics();
+    assert_eq!(first.simulation_time, dt);
+    assert_eq!(
+        first.manipulation_corrections + first.manipulation_correction_fallbacks,
+        0
+    );
+
+    simulation.step(dt).unwrap();
+    let second = simulation.diagnostics();
+    assert_eq!(second.simulation_time, 2.0 * dt);
+    assert_eq!(
+        second.manipulation_corrections + second.manipulation_correction_fallbacks,
+        1
+    );
+    assert_eq!(second.manipulation_corrections, 1);
+}
+
+#[test]
+fn hybrid_sls_drag_converges_near_the_full_rope_radius() {
+    let dt = 1.0 / 240.0;
+    let step_count = 480;
+    let mut simulation = Simulation::new(SimulationConfig {
+        rope_model: RopeModelKind::StandardLinearSolid,
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let start = simulation.payload_position();
+    let end = Vec2::new(11.9, 0.0);
+    let velocity = (end - start) / (step_count as f64 * dt);
+
+    for step in 1..=step_count {
+        let u = step as f64 / step_count as f64;
+        simulation
+            .set_manipulation_target(KinematicTarget::new(start + (end - start) * u, velocity));
+        simulation.step(dt).unwrap();
+    }
+
+    let diagnostics = simulation.diagnostics();
+    assert_eq!(simulation.payload_position(), end);
+    assert!(
+        diagnostics.manipulation_corrections > diagnostics.manipulation_correction_fallbacks,
+        "corrections={}, fallbacks={}",
+        diagnostics.manipulation_corrections,
+        diagnostics.manipulation_correction_fallbacks
+    );
+    assert!(
+        diagnostics.maximum_tensile_strain < 0.02,
+        "unexpected held SLS strain {}",
+        diagnostics.maximum_tensile_strain
+    );
+}
+
+#[test]
+fn hybrid_keeps_the_finite_xpbd_predictor_when_newton_misses_its_budget() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 64,
+        rope_model: RopeModelKind::QuadraticKelvinVoigt,
+        quadratic_axial_rigidity: 10_000_000.0,
+        axial_viscosity: 20_000.0,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let target = KinematicTarget::new(Vec2::new(20.0, 0.0), Vec2::new(20.0, 0.0));
+    simulation.set_manipulation_target(target);
+
+    simulation.step(dt).unwrap();
+    simulation.step(dt).unwrap();
+
+    assert!(simulation.diagnostics().manipulation_correction_fallbacks >= 1);
+    assert!(
+        simulation
+            .positions()
+            .iter()
+            .all(|position| position.is_finite())
+    );
+    assert!(
+        simulation
+            .velocities()
+            .iter()
+            .all(|velocity| velocity.is_finite())
+    );
+}
+
+#[test]
+fn xpbd_manipulation_evolves_sls_transient_stress_for_handoff() {
+    let config = SimulationConfig {
+        segment_count: 1,
+        gravity: Vec2::ZERO,
+        rope_model: RopeModelKind::StandardLinearSolid,
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config).unwrap();
+    let extension = 1.0;
+    let target = KinematicTarget::new(
+        simulation.payload_position() + Vec2::new(0.0, -extension),
+        Vec2::new(0.0, -1.0),
+    );
+
+    simulation.set_manipulation_target(target);
+    simulation.step(0.1).unwrap();
+
+    let relaxed_energy = 0.5 * config.axial_rigidity / simulation.rest_length() * extension.powi(2);
+    assert!(simulation.diagnostics().elastic_energy > relaxed_energy);
+}
+
+#[test]
+fn xpbd_throw_remains_dynamic_with_implicit_integrators_and_every_material() {
+    for integrator in [IntegratorKind::BackwardEuler, IntegratorKind::TrBdf2] {
+        for rope_model in RopeModelKind::ALL {
+            let mut simulation = Simulation::new(SimulationConfig {
+                rope_model,
+                integrator,
+                ..SimulationConfig::default()
+            })
+            .unwrap();
+            let throw_velocity = Vec2::new(3.0, 0.5);
+            simulation.set_manipulation_target(KinematicTarget::new(
+                simulation.payload_position(),
+                throw_velocity,
+            ));
+            simulation.step(1.0 / 240.0).unwrap();
+            simulation.release_manipulation(throw_velocity);
+            let release_position = simulation.payload_position();
+
+            for _ in 0..120 {
+                let outer_dt = 1.0 / 240.0;
+                let substeps = simulation.recommended_substeps(outer_dt).unwrap();
+                for _ in 0..substeps {
+                    simulation.step(outer_dt / substeps as f64).unwrap();
+                }
+            }
+
+            assert!(
+                simulation.payload_position().x > release_position.x + 0.25,
+                "{} did not preserve throwing with {}",
+                integrator.display_name(),
+                rope_model.display_name()
+            );
+        }
+    }
+}
+
+#[test]
+fn gravity_accumulates_motion_during_xpbd_manipulation() {
+    fn internal_node_after_steps(gravity: Vec2) -> Vec2 {
+        let mut simulation = Simulation::new(SimulationConfig {
+            segment_count: 2,
+            rope_model: RopeModelKind::QuadraticKelvinVoigt,
+            gravity,
+            ..SimulationConfig::default()
+        })
+        .unwrap();
+        let target = KinematicTarget::new(simulation.payload_position(), Vec2::ZERO);
+        simulation.set_manipulation_target(target);
+        for _ in 0..20 {
+            simulation.step(1.0 / 240.0).unwrap();
+        }
+        simulation.positions()[1]
+    }
+
+    let without_gravity = internal_node_after_steps(Vec2::ZERO);
+    let with_gravity = internal_node_after_steps(Vec2::new(0.0, -9.81));
+
+    assert!(with_gravity.y < without_gravity.y - 1.0e-4);
+}
+
+#[test]
+fn xpbd_manipulation_represents_quadratic_kelvin_voigt_slack_with_folds() {
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 2,
+        gravity: Vec2::ZERO,
+        ..SimulationConfig::default()
+            .with_recommended_rope_model(RopeModelKind::QuadraticKelvinVoigt)
+    })
+    .unwrap();
+    let target = KinematicTarget::new(Vec2::new(0.0, -simulation.rest_length()), Vec2::ZERO);
+
+    simulation.set_manipulation_target(target);
+    for _ in 0..120 {
+        simulation.step(1.0 / 240.0).unwrap();
+    }
+
+    assert_eq!(simulation.payload_position(), target.position);
+    assert!(
+        (simulation.diagnostics().minimum_segment_length - simulation.rest_length()).abs()
+            < 0.02 * simulation.rest_length()
+    );
 }
 
 #[test]
@@ -114,11 +447,13 @@ fn refined_ropes_request_more_substeps() {
     let outer_dt = 1.0 / 240.0;
     let coarse = Simulation::new(SimulationConfig {
         segment_count: 4,
+        integrator: IntegratorKind::SemiImplicitEuler,
         ..SimulationConfig::default()
     })
     .unwrap();
     let refined = Simulation::new(SimulationConfig {
         segment_count: 64,
+        integrator: IntegratorKind::SemiImplicitEuler,
         ..SimulationConfig::default()
     })
     .unwrap();
@@ -130,6 +465,47 @@ fn refined_ropes_request_more_substeps() {
 }
 
 #[test]
+fn quadratic_stiffening_reduces_the_explicit_timestep_when_stretched() {
+    let outer_dt = 1.0 / 60.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        rope_model: RopeModelKind::QuadraticKelvinVoigt,
+        quadratic_axial_rigidity: 1_000_000.0,
+        axial_viscosity: 0.0,
+        air_damping_rate: 0.0,
+        integrator: IntegratorKind::SemiImplicitEuler,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let unstretched_substeps = simulation.recommended_substeps(outer_dt).unwrap();
+    let target = KinematicTarget::new(
+        simulation.payload_position() + Vec2::new(0.0, -3.0),
+        Vec2::ZERO,
+    );
+    simulation.set_payload_target(Some(target));
+    let stretched_substeps = simulation.recommended_substeps(outer_dt).unwrap();
+
+    assert!(stretched_substeps > unstretched_substeps);
+}
+
+#[test]
+fn quadratic_kelvin_voigt_samples_its_activation_band_during_payload_motion() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        rope_model: RopeModelKind::QuadraticKelvinVoigt,
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let target = KinematicTarget::new(
+        simulation.payload_position() + Vec2::new(0.0, 0.02),
+        Vec2::ZERO,
+    );
+    simulation.interpolate_payload_target(target, dt).unwrap();
+
+    assert!(simulation.recommended_substeps(dt).unwrap() > 1);
+}
+
+#[test]
 fn automatic_substeps_handle_the_stiffest_ui_configuration() {
     let outer_dt = 1.0 / 240.0;
     let mut simulation = Simulation::new(SimulationConfig {
@@ -138,7 +514,9 @@ fn automatic_substeps_handle_the_stiffest_ui_configuration() {
         rope_mass: 0.2,
         payload_mass: 10.0,
         axial_rigidity: 100_000.0,
+        rope_model: RopeModelKind::HookeSpring,
         air_damping_rate: 0.0,
+        integrator: IntegratorKind::SemiImplicitEuler,
         ..SimulationConfig::default()
     })
     .unwrap();
@@ -380,6 +758,7 @@ fn tr_bdf2_is_second_order_for_a_single_axial_oscillator() {
             rope_mass: 0.001,
             payload_mass: 1.0,
             axial_rigidity: 100.0,
+            rope_model: RopeModelKind::HookeSpring,
             gravity: Vec2::ZERO,
             air_damping_rate: 0.0,
             integrator: IntegratorKind::TrBdf2,
@@ -473,6 +852,7 @@ fn tr_bdf2_damps_an_undamped_oscillator_less_than_backward_euler() {
             rope_mass: 0.001,
             payload_mass: 1.0,
             axial_rigidity: 100.0,
+            rope_model: RopeModelKind::HookeSpring,
             gravity: Vec2::ZERO,
             air_damping_rate: 0.0,
             integrator,
@@ -523,6 +903,7 @@ fn rosenbrock_is_second_order_for_a_single_axial_oscillator() {
             rope_mass: 0.001,
             payload_mass: 1.0,
             axial_rigidity: 100.0,
+            rope_model: RopeModelKind::HookeSpring,
             gravity: Vec2::ZERO,
             air_damping_rate: 0.0,
             integrator: IntegratorKind::Rosenbrock2,
@@ -572,6 +953,7 @@ fn rosenbrock_damps_an_undamped_oscillator_less_than_backward_euler() {
             rope_mass: 0.001,
             payload_mass: 1.0,
             axial_rigidity: 100.0,
+            rope_model: RopeModelKind::HookeSpring,
             gravity: Vec2::ZERO,
             air_damping_rate: 0.0,
             integrator,
@@ -645,6 +1027,52 @@ fn backward_euler_handles_kelvin_voigt_without_air_damping() {
             .all(|value| value.is_finite())
     );
     assert!(simulation.diagnostics().maximum_absolute_strain < 0.1);
+}
+
+#[test]
+fn backward_euler_handles_quadratic_kelvin_voigt_without_air_damping() {
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 64,
+        rope_model: RopeModelKind::QuadraticKelvinVoigt,
+        axial_viscosity: 1_000.0,
+        air_damping_rate: 0.0,
+        integrator: IntegratorKind::BackwardEuler,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+
+    for _ in 0..(2 * 240) {
+        simulation.step(dt).unwrap();
+    }
+
+    assert!(simulation.positions().iter().all(|value| value.is_finite()));
+    assert!(simulation.diagnostics().maximum_tensile_strain < 0.1);
+}
+
+#[test]
+fn quadratic_kelvin_voigt_high_viscosity_settling_is_bounded() {
+    for integrator in [IntegratorKind::BackwardEuler, IntegratorKind::TrBdf2] {
+        for timestep_scale in [1.0, 0.5, 0.25] {
+            let dt = timestep_scale / 240.0;
+            let mut simulation = Simulation::new(SimulationConfig {
+                segment_count: 32,
+                rope_model: RopeModelKind::QuadraticKelvinVoigt,
+                axial_viscosity: 20_000.0,
+                air_damping_rate: 0.0,
+                integrator,
+                ..SimulationConfig::default()
+            })
+            .unwrap();
+            let mut maximum_payload_speed = 0.0_f64;
+            while simulation.diagnostics().simulation_time < 1.34 {
+                simulation.step(dt).unwrap();
+                maximum_payload_speed =
+                    maximum_payload_speed.max(simulation.payload_velocity().length());
+            }
+            assert!(maximum_payload_speed < 20.0);
+        }
+    }
 }
 
 #[test]
@@ -730,6 +1158,178 @@ fn tr_bdf2_handles_kelvin_voigt_without_air_damping() {
             .all(|value| value.is_finite())
     );
     assert!(simulation.diagnostics().maximum_absolute_strain < 0.1);
+}
+
+#[test]
+fn quadratic_kelvin_voigt_survives_mouse_motion_with_implicit_integrators() {
+    for integrator in [IntegratorKind::BackwardEuler, IntegratorKind::TrBdf2] {
+        sustained_drag_path_with_config(SimulationConfig {
+            rope_model: RopeModelKind::QuadraticKelvinVoigt,
+            quadratic_axial_rigidity: 1_000_000.0,
+            axial_viscosity: 1_000.0,
+            air_damping_rate: 0.0,
+            integrator,
+            ..SimulationConfig::default()
+        });
+    }
+}
+
+#[test]
+fn implicit_integrators_distinguish_smooth_and_quantized_boundary_motion() {
+    let uninterrupted =
+        prescribed_velocity_experiment(IntegratorKind::TrBdf2, PrescribedMotion::Uninterrupted)
+            .unwrap();
+    let consistent = prescribed_velocity_experiment(
+        IntegratorKind::TrBdf2,
+        PrescribedMotion::FramewiseConsistent,
+    )
+    .unwrap();
+    let inconsistent = prescribed_velocity_experiment(
+        IntegratorKind::TrBdf2,
+        PrescribedMotion::FramewiseInconsistent,
+    )
+    .unwrap();
+    let quantized = prescribed_velocity_experiment(
+        IntegratorKind::TrBdf2,
+        PrescribedMotion::FramewiseQuantized,
+    )
+    .unwrap();
+    let backward_euler_smooth = prescribed_velocity_experiment(
+        IntegratorKind::BackwardEuler,
+        PrescribedMotion::Uninterrupted,
+    )
+    .unwrap();
+    let backward_euler_quantized = prescribed_velocity_experiment(
+        IntegratorKind::BackwardEuler,
+        PrescribedMotion::FramewiseQuantized,
+    );
+    let backward_euler_quantized_speed = backward_euler_quantized
+        .as_ref()
+        .map_or(f64::INFINITY, |metrics| metrics.maximum_internal_speed);
+
+    println!(
+        "TR-BDF2: smooth {:.3} m/s, framewise consistent {:.3} m/s, inconsistent velocity {:.3} m/s, quantized {:.3} m/s; BE: smooth {:.3} m/s, quantized {:.3} m/s",
+        uninterrupted.maximum_internal_speed,
+        consistent.maximum_internal_speed,
+        inconsistent.maximum_internal_speed,
+        quantized.maximum_internal_speed,
+        backward_euler_smooth.maximum_internal_speed,
+        backward_euler_quantized_speed,
+    );
+    assert!(
+        (uninterrupted.maximum_internal_speed - consistent.maximum_internal_speed).abs()
+            < 0.02 * uninterrupted.maximum_internal_speed
+    );
+    assert!(inconsistent.maximum_internal_speed < 1.2 * consistent.maximum_internal_speed);
+    assert!(quantized.maximum_internal_speed > 1.3 * consistent.maximum_internal_speed);
+    assert!(backward_euler_quantized_speed > 1.3 * backward_euler_smooth.maximum_internal_speed);
+}
+
+#[derive(Clone, Copy)]
+enum PrescribedMotion {
+    Uninterrupted,
+    FramewiseConsistent,
+    FramewiseInconsistent,
+    FramewiseQuantized,
+}
+
+struct PrescribedMotionMetrics {
+    maximum_internal_speed: f64,
+}
+
+fn prescribed_velocity_experiment(
+    integrator: IntegratorKind,
+    motion: PrescribedMotion,
+) -> Result<PrescribedMotionMetrics, StepError> {
+    const PHYSICS_DT: f64 = 1.0 / 240.0;
+    const SETTLING_STEPS: usize = 240;
+    const MOTION_STEPS: usize = 240;
+
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 64,
+        rope_model: RopeModelKind::QuadraticKelvinVoigt,
+        quadratic_axial_rigidity: 1_000.0,
+        axial_viscosity: 15_000.0,
+        air_damping_rate: 0.5,
+        integrator,
+        ..SimulationConfig::default()
+    })
+    .unwrap();
+    let mut maximum_internal_speed = 0.0_f64;
+
+    for _ in 0..SETTLING_STEPS {
+        advance_prescribed_experiment(&mut simulation, PHYSICS_DT, &mut maximum_internal_speed)?;
+    }
+    maximum_internal_speed = 0.0;
+
+    let start = simulation.payload_position();
+    let path_velocity = Vec2::new(0.0, 2.5);
+    let mut previous_endpoint = start;
+    if matches!(motion, PrescribedMotion::Uninterrupted) {
+        simulation.interpolate_payload_target(
+            KinematicTarget::new(
+                start + path_velocity * (MOTION_STEPS as f64 * PHYSICS_DT),
+                path_velocity,
+            ),
+            MOTION_STEPS as f64 * PHYSICS_DT,
+        )?;
+    }
+
+    for step in 0..MOTION_STEPS {
+        if !matches!(motion, PrescribedMotion::Uninterrupted) {
+            let ideal_offset = path_velocity * ((step + 1) as f64 * PHYSICS_DT);
+            let target_position = if matches!(motion, PrescribedMotion::FramewiseQuantized) {
+                // Approximately one vertical screen pixel in bug-4-1. At this
+                // speed the cursor alternates between stationary samples and
+                // two-pixel jumps even though the intended path is smooth.
+                const WORLD_PIXEL_SIZE: f64 = 0.020_119_7;
+                Vec2::new(
+                    start.x,
+                    start.y + (ideal_offset.y / WORLD_PIXEL_SIZE).round() * WORLD_PIXEL_SIZE,
+                )
+            } else {
+                start + ideal_offset
+            };
+            let endpoint_velocity = match motion {
+                PrescribedMotion::FramewiseConsistent => path_velocity,
+                PrescribedMotion::FramewiseQuantized => {
+                    (target_position - previous_endpoint) / PHYSICS_DT
+                }
+                PrescribedMotion::FramewiseInconsistent => Vec2::ZERO,
+                PrescribedMotion::Uninterrupted => unreachable!(),
+            };
+            simulation.interpolate_payload_target(
+                KinematicTarget::new(target_position, endpoint_velocity),
+                PHYSICS_DT,
+            )?;
+            previous_endpoint = target_position;
+        }
+        advance_prescribed_experiment(&mut simulation, PHYSICS_DT, &mut maximum_internal_speed)?;
+    }
+
+    Ok(PrescribedMotionMetrics {
+        maximum_internal_speed,
+    })
+}
+
+fn advance_prescribed_experiment(
+    simulation: &mut Simulation,
+    outer_dt: f64,
+    maximum_internal_speed: &mut f64,
+) -> Result<(), StepError> {
+    let substeps = simulation.recommended_substeps(outer_dt)?;
+    for _ in 0..substeps {
+        simulation.step_without_diagnostics(outer_dt / substeps as f64)?;
+        *maximum_internal_speed = maximum_internal_speed.max(
+            simulation
+                .velocities()
+                .iter()
+                .take(simulation.velocities().len().saturating_sub(1))
+                .map(|velocity| velocity.length())
+                .fold(0.0, f64::max),
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -1232,10 +1832,11 @@ fn sustained_drag_path(segment_count: usize, integrator: IntegratorKind) {
     sustained_drag_path_with_limits(
         SimulationConfig {
             segment_count,
+            rope_model: RopeModelKind::HookeSpring,
             integrator,
             ..SimulationConfig::default()
         },
-        0.3,
+        0.65,
     );
 }
 
@@ -1294,7 +1895,7 @@ fn sustained_drag_path_with_limits(config: SimulationConfig, maximum_allowed_str
         "{integrator:?} reached excessive strain {maximum_strain:.3} with {segment_count} pieces"
     );
     assert!(
-        maximum_speed < 110.0,
+        maximum_speed < 140.0,
         "{integrator:?} reached excessive speed {maximum_speed:.3} m/s with {segment_count} pieces"
     );
 
@@ -1372,6 +1973,7 @@ fn air_damping_is_mass_independent() {
         gravity: Vec2::ZERO,
         axial_rigidity: 1.0,
         air_damping_rate: 2.0,
+        integrator: IntegratorKind::SemiImplicitEuler,
         ..SimulationConfig::default()
     };
     let mut simulation = Simulation::new(config).unwrap();

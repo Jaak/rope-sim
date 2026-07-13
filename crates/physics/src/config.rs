@@ -7,16 +7,18 @@ use crate::math::Vec2;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RopeModelKind {
-    #[default]
     HookeSpring,
     KelvinVoigt,
+    QuadraticKelvinVoigt,
+    #[default]
     StandardLinearSolid,
 }
 
 impl RopeModelKind {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::HookeSpring,
         Self::KelvinVoigt,
+        Self::QuadraticKelvinVoigt,
         Self::StandardLinearSolid,
     ];
 
@@ -24,6 +26,7 @@ impl RopeModelKind {
         match self {
             Self::HookeSpring => "Hooke spring",
             Self::KelvinVoigt => "Kelvin-Voigt",
+            Self::QuadraticKelvinVoigt => "Quadratic Kelvin-Voigt (tension only)",
             Self::StandardLinearSolid => "Standard linear solid",
         }
     }
@@ -42,6 +45,10 @@ pub struct SimulationConfig {
     pub payload_mass: f64,
     /// Combined axial rigidity EA in newtons.
     pub axial_rigidity: f64,
+    /// Quadratic tensile rigidity in newtons. For tensile strain `e`, the
+    /// quadratic Kelvin-Voigt model contributes `quadratic_axial_rigidity*e^2`.
+    #[serde(default = "default_quadratic_axial_rigidity")]
+    pub quadratic_axial_rigidity: f64,
     /// Additional instantaneous axial rigidity of the Maxwell branch in the
     /// standard linear solid model, in newtons.
     pub transient_axial_rigidity: f64,
@@ -68,24 +75,63 @@ impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
             segment_count: 20,
-            // Representative 10.5 mm low-stretch kernmantle rope:
-            // 75 g/m, with roughly 3.4% static elongation.
+            // Petzl VOLTA GUIDE 9 mm reference scene: 54 g/m and an 80 kg
+            // single-rope test mass. SLS parameters are calibrated separately
+            // against its published static and EN 892/UIAA dynamic results.
             rope_length: 12.0,
-            rope_mass: 0.9,
+            rope_mass: 0.648,
             payload_mass: 80.0,
-            axial_rigidity: 30_000.0,
-            transient_axial_rigidity: 15_000.0,
-            rope_model: RopeModelKind::HookeSpring,
-            axial_viscosity: 1_000.0,
-            air_damping_rate: 0.5,
+            axial_rigidity: SLS_RELAXED_RIGIDITY,
+            quadratic_axial_rigidity: QKV_QUADRATIC_RIGIDITY,
+            transient_axial_rigidity: SLS_TRANSIENT_RIGIDITY,
+            rope_model: RopeModelKind::StandardLinearSolid,
+            axial_viscosity: SLS_VISCOSITY,
+            air_damping_rate: 0.0,
             gravity: Vec2::new(0.0, -9.81),
             anchor: Vec2::ZERO,
-            integrator: IntegratorKind::SemiImplicitEuler,
+            integrator: IntegratorKind::BackwardEuler,
         }
     }
 }
 
 impl SimulationConfig {
+    /// Load the recommended parameters for one constitutive model.
+    ///
+    /// SLS is calibrated to the VOLTA GUIDE 9 mm aggregate measurements, KV
+    /// is the best static-constrained compromise, and Hooke/QKV are deliberately
+    /// lively illustrative presets rather than claimed material fits.
+    pub fn apply_recommended_rope_model(&mut self, rope_model: RopeModelKind) {
+        self.rope_model = rope_model;
+        match rope_model {
+            RopeModelKind::HookeSpring => {
+                self.axial_rigidity = HOOKE_DYNAMIC_RIGIDITY;
+                self.air_damping_rate = FUN_AIR_DAMPING_RATE;
+            }
+            RopeModelKind::KelvinVoigt => {
+                self.axial_rigidity = RELAXED_RIGIDITY;
+                self.axial_viscosity = KELVIN_VOIGT_VISCOSITY;
+                self.air_damping_rate = 0.0;
+            }
+            RopeModelKind::QuadraticKelvinVoigt => {
+                self.axial_rigidity = QKV_LINEAR_RIGIDITY;
+                self.quadratic_axial_rigidity = QKV_QUADRATIC_RIGIDITY;
+                self.axial_viscosity = QKV_VISCOSITY;
+                self.air_damping_rate = FUN_AIR_DAMPING_RATE;
+            }
+            RopeModelKind::StandardLinearSolid => {
+                self.axial_rigidity = SLS_RELAXED_RIGIDITY;
+                self.transient_axial_rigidity = SLS_TRANSIENT_RIGIDITY;
+                self.axial_viscosity = SLS_VISCOSITY;
+                self.air_damping_rate = 0.0;
+            }
+        }
+    }
+
+    pub fn with_recommended_rope_model(mut self, rope_model: RopeModelKind) -> Self {
+        self.apply_recommended_rope_model(rope_model);
+        self
+    }
+
     pub fn validate(self) -> Result<Self, ConfigError> {
         if self.segment_count == 0 {
             return Err(ConfigError::ZeroSegments);
@@ -95,6 +141,7 @@ impl SimulationConfig {
         validate_positive("rope mass", self.rope_mass)?;
         validate_positive("payload mass", self.payload_mass)?;
         validate_positive("axial rigidity", self.axial_rigidity)?;
+        validate_nonnegative("quadratic axial rigidity", self.quadratic_axial_rigidity)?;
         validate_positive("transient axial rigidity", self.transient_axial_rigidity)?;
         if self.rope_model == RopeModelKind::StandardLinearSolid {
             validate_positive("axial viscosity", self.axial_viscosity)?;
@@ -113,6 +160,21 @@ impl SimulationConfig {
         Ok(self)
     }
 }
+
+const fn default_quadratic_axial_rigidity() -> f64 {
+    QKV_QUADRATIC_RIGIDITY
+}
+
+const RELAXED_RIGIDITY: f64 = 10_335.377;
+const HOOKE_DYNAMIC_RIGIDITY: f64 = 25_281.9;
+const KELVIN_VOIGT_VISCOSITY: f64 = 2_045.3;
+const QKV_LINEAR_RIGIDITY: f64 = 30_000.0;
+const QKV_QUADRATIC_RIGIDITY: f64 = 100_000.0;
+const QKV_VISCOSITY: f64 = 0.6;
+const SLS_RELAXED_RIGIDITY: f64 = RELAXED_RIGIDITY;
+const SLS_TRANSIENT_RIGIDITY: f64 = 18_325.2;
+const SLS_VISCOSITY: f64 = 7_288.0;
+const FUN_AIR_DAMPING_RATE: f64 = 0.05;
 
 fn validate_nonnegative(name: &'static str, value: f64) -> Result<(), ConfigError> {
     if !value.is_finite() || value < 0.0 {

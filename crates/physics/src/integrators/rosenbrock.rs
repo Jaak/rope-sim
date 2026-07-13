@@ -118,6 +118,7 @@ impl TimeIntegrator for Rosenbrock2 {
     fn recommended_substeps(
         &self,
         system: &dyn DynamicalSystem,
+        state: &State,
         outer_dt: f64,
     ) -> Result<usize, StepError> {
         validate_timestep(outer_dt)?;
@@ -126,8 +127,8 @@ impl TimeIntegrator for Rosenbrock2 {
         } else {
             FREE_MOTION_LIMIT_MULTIPLIER
         };
-        let linearization_limit =
-            (multiplier * system.elastic_stable_timestep()).min(system.kinematic_timestep_limit());
+        let linearization_limit = (multiplier * system.elastic_stable_timestep(state))
+            .min(system.kinematic_timestep_limit());
         let requested = (outer_dt / linearization_limit).ceil().max(1.0) as usize;
         Ok(requested)
     }

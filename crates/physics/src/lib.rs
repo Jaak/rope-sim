@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod calibration;
 mod config;
 mod dynamics;
 mod integrators;
@@ -11,7 +12,12 @@ mod math;
 mod recorded_scenario;
 mod simulation;
 mod state;
+mod xpbd;
 
+pub use calibration::{
+    CalibrationError, CalibrationMeasurements, CalibrationSettings, DynamicRopeReference,
+    VOLTA_GUIDE_9MM, run_dynamic_rope_calibration,
+};
 pub use config::{ConfigError, RopeModelKind, SimulationConfig};
 pub use integrators::{IntegratorKind, StepError};
 pub use kinematics::KinematicTarget;

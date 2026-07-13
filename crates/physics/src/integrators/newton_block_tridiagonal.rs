@@ -10,7 +10,8 @@ const ZERO_MATRIX2: Matrix2 = [[0.0; 2]; 2];
 ///
 /// Each dynamic rope node contributes a 2x2 block. Axial elements only couple
 /// neighboring nodes, so the resulting matrix is block tridiagonal even when
-/// either endpoint is prescribed.
+/// either endpoint is prescribed. Factorization and solution are separate so
+/// their costs can be measured and optimized independently.
 pub(super) struct NewtonBlockTridiagonalSolver {
     lower: Vec<Matrix2>,
     diagonal: Vec<Matrix2>,
@@ -28,15 +29,13 @@ impl NewtonBlockTridiagonalSolver {
         }
     }
 
-    pub fn solve(
+    pub fn factorize(
         &mut self,
         acceleration_blocks: &[AccelerationJacobianBlock],
         node_to_unknown: &[usize],
-        residual: &[f64],
+        block_count: usize,
         dt: f64,
-        output: &mut [f64],
     ) -> Result<(), StepError> {
-        let block_count = residual.len() / 2;
         self.lower
             .resize(block_count.saturating_sub(1), ZERO_MATRIX2);
         self.diagonal.resize(block_count, ZERO_MATRIX2);
@@ -47,10 +46,9 @@ impl NewtonBlockTridiagonalSolver {
         self.diagonal.fill(ZERO_MATRIX2);
         self.reduced_upper.fill(ZERO_MATRIX2);
 
-        for (block, diagonal) in self.diagonal.iter_mut().enumerate() {
+        for diagonal in &mut self.diagonal {
             diagonal[0][0] = 1.0;
             diagonal[1][1] = 1.0;
-            self.right_hand_side[block] = Vec2::new(-residual[2 * block], -residual[2 * block + 1]);
         }
 
         let dt_squared = dt * dt;
@@ -82,7 +80,7 @@ impl NewtonBlockTridiagonalSolver {
         }
 
         // reduced_upper initially stores the original upper blocks. It is
-        // overwritten in place with D_i^-1 U_i during elimination.
+        // overwritten in place with D_i^-1 U_i during factorization.
         for index in 0..block_count {
             if index > 0 {
                 self.diagonal[index] = subtract_matrix_product(
@@ -90,16 +88,31 @@ impl NewtonBlockTridiagonalSolver {
                     self.lower[index - 1],
                     self.reduced_upper[index - 1],
                 );
+            }
+            ensure_invertible(self.diagonal[index])?;
+            if index + 1 < block_count {
+                self.reduced_upper[index] =
+                    solve_matrix2_columns(self.diagonal[index], self.reduced_upper[index])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn solve(&mut self, residual: &[f64], output: &mut [f64]) -> Result<(), StepError> {
+        let block_count = residual.len() / 2;
+        self.right_hand_side.resize(block_count, Vec2::ZERO);
+        for (block, right_hand_side) in self.right_hand_side.iter_mut().enumerate() {
+            *right_hand_side = Vec2::new(-residual[2 * block], -residual[2 * block + 1]);
+        }
+
+        for index in 0..block_count {
+            if index > 0 {
                 let previous = self.right_hand_side[index - 1];
                 self.right_hand_side[index] -=
                     multiply_matrix_vector(self.lower[index - 1], previous);
             }
             self.right_hand_side[index] =
                 solve_matrix2(self.diagonal[index], self.right_hand_side[index])?;
-            if index + 1 < block_count {
-                self.reduced_upper[index] =
-                    solve_matrix2_columns(self.diagonal[index], self.reduced_upper[index])?;
-            }
         }
 
         for index in (0..block_count.saturating_sub(1)).rev() {
@@ -117,6 +130,10 @@ impl NewtonBlockTridiagonalSolver {
             Err(StepError::SingularJacobian)
         }
     }
+}
+
+fn ensure_invertible(matrix: Matrix2) -> Result<(), StepError> {
+    solve_matrix2(matrix, Vec2::ZERO).map(|_| ())
 }
 
 fn solve_matrix2(matrix: Matrix2, rhs: Vec2) -> Result<Vec2, StepError> {
@@ -212,15 +229,11 @@ mod tests {
 
         let node_to_unknown = [0, 2, 4];
         let mut actual = vec![0.0; 2 * expected.len()];
-        NewtonBlockTridiagonalSolver::new(expected.len())
-            .solve(
-                &acceleration_blocks,
-                &node_to_unknown,
-                &residual,
-                1.0,
-                &mut actual,
-            )
+        let mut solver = NewtonBlockTridiagonalSolver::new(expected.len());
+        solver
+            .factorize(&acceleration_blocks, &node_to_unknown, expected.len(), 1.0)
             .unwrap();
+        solver.solve(&residual, &mut actual).unwrap();
 
         for (block, expected) in expected.iter().enumerate() {
             assert!((actual[2 * block] - expected.x).abs() < 1.0e-12);

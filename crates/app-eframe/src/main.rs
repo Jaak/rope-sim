@@ -54,6 +54,7 @@ struct RopeSimApp {
     dragging_payload: bool,
     viewport_id: Option<egui::Id>,
     previous_drag_position: Option<Vec2>,
+    drag_offset: Vec2,
     drag_velocity: Vec2,
     scenarios: ScenarioController,
     scenario_name: String,
@@ -85,6 +86,7 @@ impl RopeSimApp {
             dragging_payload: false,
             viewport_id: None,
             previous_drag_position: None,
+            drag_offset: Vec2::ZERO,
             drag_velocity: Vec2::ZERO,
             scenarios: ScenarioController::default(),
             scenario_name: "recorded-motion".to_owned(),
@@ -157,6 +159,7 @@ impl RopeSimApp {
 
                         ui.separator();
                         ui.heading("Material and environment");
+                        let previous_rope_model = self.config.rope_model;
                         egui::ComboBox::from_id_salt("rope_model")
                             .selected_text(self.config.rope_model.display_name())
                             .show_ui(ui, |ui| {
@@ -168,6 +171,10 @@ impl RopeSimApp {
                                     );
                                 }
                             });
+                        if self.config.rope_model != previous_rope_model {
+                            self.config
+                                .apply_recommended_rope_model(self.config.rope_model);
+                        }
                         let rigidity_label =
                             if self.config.rope_model == RopeModelKind::StandardLinearSolid {
                                 "Relaxed rigidity EA_inf (N)"
@@ -179,6 +186,16 @@ impl RopeSimApp {
                                 .logarithmic(true)
                                 .text(rigidity_label),
                         );
+                        if self.config.rope_model == RopeModelKind::QuadraticKelvinVoigt {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.config.quadratic_axial_rigidity,
+                                    1_000.0..=10_000_000.0,
+                                )
+                                .logarithmic(true)
+                                .text("Quadratic rigidity A2 (N)"),
+                            );
+                        }
                         if self.config.rope_model == RopeModelKind::StandardLinearSolid {
                             ui.add(
                                 egui::Slider::new(
@@ -191,7 +208,9 @@ impl RopeSimApp {
                         }
                         if matches!(
                             self.config.rope_model,
-                            RopeModelKind::KelvinVoigt | RopeModelKind::StandardLinearSolid
+                            RopeModelKind::KelvinVoigt
+                                | RopeModelKind::QuadraticKelvinVoigt
+                                | RopeModelKind::StandardLinearSolid
                         ) {
                             ui.add(
                                 egui::Slider::new(
@@ -452,8 +471,51 @@ impl RopeSimApp {
                                         );
                                         diagnostic_row(
                                             ui,
+                                            "Jacobian builds",
+                                            self.diagnostics.jacobian_assemblies as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Sparse fallbacks",
+                                            self.diagnostics.sparse_factorizations as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Line backtracks",
+                                            self.diagnostics.line_search_backtracks as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
                                             "Adaptive retries",
                                             self.diagnostics.adaptive_retries as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Hybrid corrections",
+                                            self.diagnostics.manipulation_corrections as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Hybrid fallbacks",
+                                            self.diagnostics.manipulation_correction_fallbacks
+                                                as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Hybrid last residual",
+                                            self.diagnostics.manipulation_last_fallback_residual,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Release handoffs",
+                                            self.diagnostics.manipulation_release_handoffs as f64,
                                             "",
                                         );
                                         diagnostic_row(
@@ -602,15 +664,20 @@ impl RopeSimApp {
                     <= GRAB_RADIUS
             })
         {
+            let payload_position = self.simulation.payload_position();
+            let pointer_world = transform.screen_to_world(
+                pointer_position.expect("a successful payload hit test has a pointer position"),
+            );
             self.dragging_payload = true;
-            self.previous_drag_position = None;
+            self.drag_offset = payload_position - pointer_world;
+            self.previous_drag_position = Some(payload_position);
             self.drag_velocity = Vec2::ZERO;
         }
 
         let primary_down = response.ctx.input(|input| input.pointer.primary_down());
         if self.dragging_payload && primary_down {
             if let Some(pointer) = pointer_position {
-                let world_position = transform.screen_to_world(pointer);
+                let world_position = transform.screen_to_world(pointer) + self.drag_offset;
                 let measured_velocity = self
                     .previous_drag_position
                     .map(|previous| (world_position - previous) / frame_dt.max(1.0e-6))
@@ -630,27 +697,30 @@ impl RopeSimApp {
                 } else {
                     let base_duration =
                         (frame_dt.min(MAX_FRAME_DT) * self.time_scale).max(DEFAULT_FIXED_DT);
-                    if let Err(error) = self
-                        .simulation
-                        .interpolate_payload_target(target, base_duration)
-                    {
-                        self.error_message = Some(error.to_string());
-                    } else {
-                        self.scenarios.record(
-                            self.diagnostics.simulation_time,
-                            MotionCommand::InterpolateTarget {
-                                target,
-                                duration: base_duration,
-                            },
-                        );
-                    }
+                    self.simulation.set_manipulation_target(target);
+                    self.scenarios.record(
+                        self.diagnostics.simulation_time,
+                        MotionCommand::InterpolateTarget {
+                            target,
+                            duration: base_duration,
+                        },
+                    );
                 }
             }
         } else if self.dragging_payload {
             self.dragging_payload = false;
             self.previous_drag_position = None;
-            let release_velocity = self.simulation.payload_velocity();
-            self.simulation.release_payload(release_velocity);
+            self.drag_offset = Vec2::ZERO;
+            let release_velocity = if self.paused {
+                self.simulation.payload_velocity()
+            } else {
+                self.drag_velocity
+            };
+            if self.paused {
+                self.simulation.release_payload(release_velocity);
+            } else {
+                self.simulation.release_manipulation(release_velocity);
+            }
             self.scenarios.record(
                 self.diagnostics.simulation_time,
                 MotionCommand::Release {
@@ -886,14 +956,13 @@ impl RopeSimApp {
         {
             match command {
                 MotionCommand::SetTarget(target) => {
-                    self.simulation.set_payload_target(Some(target));
+                    self.simulation.set_manipulation_target(target);
                 }
-                MotionCommand::InterpolateTarget { target, duration } => self
-                    .simulation
-                    .interpolate_payload_target(target, duration)
-                    .map_err(|error| error.to_string())?,
+                MotionCommand::InterpolateTarget { target, .. } => {
+                    self.simulation.set_manipulation_target(target);
+                }
                 MotionCommand::Release { velocity } => {
-                    self.simulation.release_payload(velocity);
+                    self.simulation.release_manipulation(velocity);
                 }
             }
         }
@@ -916,6 +985,7 @@ impl RopeSimApp {
         self.accumulator = 0.0;
         self.dragging_payload = false;
         self.previous_drag_position = None;
+        self.drag_offset = Vec2::ZERO;
         self.drag_velocity = Vec2::ZERO;
         self.error_message = None;
     }

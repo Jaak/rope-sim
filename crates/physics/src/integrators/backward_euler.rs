@@ -16,12 +16,14 @@ const MAX_NEWTON_ITERATIONS: usize = 12;
 const MAX_LINE_SEARCH_ITERATIONS: usize = 10;
 const MAX_ADAPTIVE_RETRY_LEVELS: usize = 4;
 const RESIDUAL_TOLERANCE: f64 = 1.0e-8;
+const INTERACTION_RESIDUAL_TOLERANCE: f64 = 1.0e-5;
 const NOT_DYNAMIC: usize = usize::MAX;
 
-pub(super) struct BackwardEuler {
+pub(crate) struct BackwardEuler {
     backup: State,
     initial: State,
     trial: State,
+    alternative_trial: State,
     dynamic_nodes: Vec<usize>,
     factorized_dynamic_nodes: Vec<usize>,
     node_to_unknown: Vec<usize>,
@@ -38,13 +40,20 @@ pub(super) struct BackwardEuler {
     statistics: IntegratorStatistics,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PredictorCorrection {
+    Converged,
+    BudgetExceeded { iterations: usize, residual: f64 },
+}
+
 impl BackwardEuler {
     pub fn new(node_count: usize) -> Self {
         let zero_positions = vec![Vec2::ZERO; node_count];
         Self {
             backup: State::new(zero_positions.clone()),
             initial: State::new(zero_positions.clone()),
-            trial: State::new(zero_positions),
+            trial: State::new(zero_positions.clone()),
+            alternative_trial: State::new(zero_positions),
             dynamic_nodes: Vec::with_capacity(node_count),
             factorized_dynamic_nodes: Vec::with_capacity(node_count),
             node_to_unknown: vec![NOT_DYNAMIC; node_count],
@@ -99,6 +108,77 @@ impl BackwardEuler {
         self.base_unknowns.resize(dimension, 0.0);
     }
 
+    fn prepare_from_predictor(
+        &mut self,
+        system: &dyn DynamicalSystem,
+        initial: &State,
+        predictor: &State,
+        dt: f64,
+        start_time: f64,
+    ) {
+        self.initial.clone_from(initial);
+        system.enforce_kinematics(&mut self.initial, start_time);
+        self.trial.clone_from(predictor);
+        system.enforce_kinematics(&mut self.trial, start_time + dt);
+        self.dynamic_nodes.clear();
+        self.node_to_unknown.fill(NOT_DYNAMIC);
+
+        for index in 0..initial.node_count() {
+            if system.is_dynamic_node(index) {
+                self.node_to_unknown[index] = 2 * self.dynamic_nodes.len();
+                self.dynamic_nodes.push(index);
+            }
+        }
+
+        if self.factorized_dynamic_nodes != self.dynamic_nodes {
+            self.factorized_dynamic_nodes
+                .clone_from(&self.dynamic_nodes);
+            self.jacobian_matrix = None;
+            self.symbolic_lu = None;
+        }
+
+        let dimension = 2 * self.dynamic_nodes.len();
+        self.accelerations.resize(initial.node_count(), Vec2::ZERO);
+        self.residual.resize(dimension, 0.0);
+        self.candidate_residual.resize(dimension, 0.0);
+        self.delta.resize(dimension, 0.0);
+        self.base_unknowns.resize(dimension, 0.0);
+
+        // XPBD is usually the better nonlinear seed during manipulation, but
+        // at high resolution a partially converged local projection can be
+        // farther from the constitutive residual than BE's inertial predictor.
+        // Evaluate both transactionally and start Newton from the better one.
+        self.alternative_trial.clone_from(&self.initial);
+        for &node in &self.dynamic_nodes {
+            self.alternative_trial.positions[node] += self.initial.velocities[node] * dt;
+        }
+        system.enforce_kinematics(&mut self.alternative_trial, start_time + dt);
+        self.statistics.residual_evaluations += 2;
+        evaluate_residual(
+            system,
+            &self.initial,
+            &mut self.trial,
+            &self.dynamic_nodes,
+            dt,
+            &mut self.accelerations,
+            &mut self.residual,
+            start_time + dt,
+        );
+        evaluate_residual(
+            system,
+            &self.initial,
+            &mut self.alternative_trial,
+            &self.dynamic_nodes,
+            dt,
+            &mut self.accelerations,
+            &mut self.candidate_residual,
+            start_time + dt,
+        );
+        if infinity_norm(&self.candidate_residual) < infinity_norm(&self.residual) {
+            self.trial.clone_from(&self.alternative_trial);
+        }
+    }
+
     fn finish(
         &mut self,
         system: &dyn DynamicalSystem,
@@ -116,6 +196,47 @@ impl BackwardEuler {
 }
 
 impl BackwardEuler {
+    pub(crate) fn correct_from_predictor(
+        &mut self,
+        system: &dyn DynamicalSystem,
+        initial: &State,
+        predictor: &State,
+        output: &mut State,
+        dt: f64,
+        maximum_iterations: usize,
+    ) -> Result<PredictorCorrection, StepError> {
+        validate_timestep(dt)?;
+        self.prepare_from_predictor(system, initial, predictor, dt, 0.0);
+        self.solve_prepared(
+            system,
+            output,
+            dt,
+            0.0,
+            maximum_iterations,
+            INTERACTION_RESIDUAL_TOLERANCE,
+        )
+    }
+
+    pub(crate) fn correct_from_predictor_fully(
+        &mut self,
+        system: &dyn DynamicalSystem,
+        initial: &State,
+        predictor: &State,
+        output: &mut State,
+        dt: f64,
+    ) -> Result<PredictorCorrection, StepError> {
+        validate_timestep(dt)?;
+        self.prepare_from_predictor(system, initial, predictor, dt, 0.0);
+        self.solve_prepared(
+            system,
+            output,
+            dt,
+            0.0,
+            MAX_NEWTON_ITERATIONS,
+            RESIDUAL_TOLERANCE,
+        )
+    }
+
     fn solve_once(
         &mut self,
         system: &dyn DynamicalSystem,
@@ -125,17 +246,47 @@ impl BackwardEuler {
     ) -> Result<(), StepError> {
         validate_timestep(dt)?;
         self.prepare(system, state, dt, start_time);
+        match self.solve_prepared(
+            system,
+            state,
+            dt,
+            start_time,
+            MAX_NEWTON_ITERATIONS,
+            RESIDUAL_TOLERANCE,
+        )? {
+            PredictorCorrection::Converged => Ok(()),
+            PredictorCorrection::BudgetExceeded {
+                iterations,
+                residual,
+            } => Err(StepError::NewtonDidNotConverge {
+                iterations,
+                residual,
+            }),
+        }
+    }
+
+    fn solve_prepared(
+        &mut self,
+        system: &dyn DynamicalSystem,
+        state: &mut State,
+        dt: f64,
+        start_time: f64,
+        maximum_iterations: usize,
+        residual_tolerance: f64,
+    ) -> Result<PredictorCorrection, StepError> {
         let end_time = start_time + dt;
 
         if self.dynamic_nodes.is_empty() {
             system.prepare_implicit_state(&self.initial, &mut self.trial, dt);
-            return self.finish(system, state, end_time);
+            self.finish(system, state, end_time)?;
+            return Ok(PredictorCorrection::Converged);
         }
 
         let dimension = self.residual.len();
         let mut last_residual = f64::INFINITY;
-        for iteration in 0..MAX_NEWTON_ITERATIONS {
+        for iteration in 0..maximum_iterations {
             self.statistics.nonlinear_iterations += 1;
+            self.statistics.residual_evaluations += 1;
             evaluate_residual(
                 system,
                 &self.initial,
@@ -148,8 +299,9 @@ impl BackwardEuler {
             );
             last_residual = infinity_norm(&self.residual);
             let scale = 1.0 + maximum_position_magnitude(&self.trial, &self.dynamic_nodes);
-            if last_residual <= RESIDUAL_TOLERANCE * scale {
-                return self.finish(system, state, end_time);
+            if last_residual <= residual_tolerance * scale {
+                self.finish(system, state, end_time)?;
+                return Ok(PredictorCorrection::Converged);
             }
 
             for index in 0..dimension {
@@ -163,14 +315,14 @@ impl BackwardEuler {
                 dt,
                 &mut self.acceleration_jacobian,
             );
+            self.statistics.jacobian_assemblies += 1;
             if self
                 .block_solver
-                .solve(
+                .factorize(
                     &self.acceleration_jacobian,
                     &self.node_to_unknown,
-                    &self.residual,
+                    self.dynamic_nodes.len(),
                     dt,
-                    &mut self.delta,
                 )
                 .is_err()
             {
@@ -189,6 +341,10 @@ impl BackwardEuler {
                     &mut self.jacobian_matrix,
                     &mut self.symbolic_lu,
                 )?;
+                self.statistics.sparse_factorizations += 1;
+            } else {
+                self.block_solver.solve(&self.residual, &mut self.delta)?;
+                self.statistics.block_factorizations += 1;
             }
             self.statistics.linear_solves += 1;
 
@@ -204,6 +360,7 @@ impl BackwardEuler {
                     );
                 }
 
+                self.statistics.residual_evaluations += 1;
                 evaluate_residual(
                     system,
                     &self.initial,
@@ -218,19 +375,28 @@ impl BackwardEuler {
                     accepted = true;
                     break;
                 }
+                self.statistics.line_search_backtracks += 1;
                 step_scale *= 0.5;
             }
 
             if !accepted {
-                return Err(StepError::NewtonDidNotConverge {
+                return Ok(PredictorCorrection::BudgetExceeded {
                     iterations: iteration + 1,
                     residual: last_residual,
                 });
             }
+
+            last_residual = infinity_norm(&self.candidate_residual);
+            let candidate_scale =
+                1.0 + maximum_position_magnitude(&self.trial, &self.dynamic_nodes);
+            if last_residual <= residual_tolerance * candidate_scale {
+                self.finish(system, state, end_time)?;
+                return Ok(PredictorCorrection::Converged);
+            }
         }
 
-        Err(StepError::NewtonDidNotConverge {
-            iterations: MAX_NEWTON_ITERATIONS,
+        Ok(PredictorCorrection::BudgetExceeded {
+            iterations: maximum_iterations,
             residual: last_residual,
         })
     }
@@ -295,6 +461,7 @@ impl TimeIntegrator for BackwardEuler {
     fn recommended_substeps(
         &self,
         system: &dyn DynamicalSystem,
+        _state: &State,
         outer_dt: f64,
     ) -> Result<usize, StepError> {
         validate_timestep(outer_dt)?;

@@ -1,31 +1,48 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ropesim_physics::{Diagnostics, IntegratorKind, MotionCommand, RecordedScenario, Simulation};
 use ropesim_physics::{KinematicTarget, RopeModelKind, SimulationConfig, Vec2};
 
 const TIME_EPSILON: f64 = 1.0e-12;
+const TIMING_RUNS: usize = 3;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_fixture_path);
-    let scenario = RecordedScenario::from_json(&fs::read_to_string(&path)?)?;
+    let mut paths: Vec<_> = env::args_os().skip(1).map(PathBuf::from).collect();
+    if paths.is_empty() {
+        paths = default_fixture_paths()?;
+    }
+
+    for path in paths {
+        report_fixture(&path)?;
+        println!();
+    }
+    report_moving_boundary_convergence()?;
+    Ok(())
+}
+
+fn report_fixture(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let scenario = RecordedScenario::from_json(&fs::read_to_string(path)?)?;
 
     println!("fixture: {}", path.display());
     println!(
-        "{:<18} {:>7} {:>6} {:>12} {:>12} {:>11} {:>11} {:>11} {:>9}",
+        "{:<18} {:>7} {:>6} {:>9} {:>12} {:>10} {:>9} {:>9} {:>9} {:>8} {:>7} {:>7} {:>7} {:>7}",
         "integrator",
         "dt (ms)",
         "air",
+        "wall ms",
         "final E",
-        "final K",
-        "final speed",
-        "post K max",
         "speed max",
-        "retries"
+        "Newton",
+        "R eval",
+        "J build",
+        "blk LU",
+        "sp LU",
+        "reject",
+        "retry",
+        "backtrk",
     );
     for integrator in [IntegratorKind::BackwardEuler, IntegratorKind::TrBdf2] {
         for timestep_scale in [1.0, 0.5, 0.25] {
@@ -40,8 +57,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for air_damping_rate in [0.5, 1.0] {
         report_run(&scenario, IntegratorKind::TrBdf2, 1.0, air_damping_rate)?;
     }
-    println!();
-    report_moving_boundary_convergence()?;
     Ok(())
 }
 
@@ -51,30 +66,57 @@ fn report_run(
     timestep_scale: f64,
     air_damping_rate: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let metrics = replay(scenario, integrator, timestep_scale, air_damping_rate)?;
+    // Keep allocation and code-page warmup outside the reported median.
+    replay(scenario, integrator, timestep_scale, air_damping_rate)?;
+    let mut runs = Vec::with_capacity(TIMING_RUNS);
+    for _ in 0..TIMING_RUNS {
+        runs.push(replay(
+            scenario,
+            integrator,
+            timestep_scale,
+            air_damping_rate,
+        )?);
+    }
+    runs.sort_by_key(|metrics| metrics.elapsed);
+    let metrics = runs.swap_remove(TIMING_RUNS / 2);
     println!(
-        "{:<18} {:>7.3} {:>6.2} {:>12.4e} {:>12.4e} {:>11.4} {:>11.4e} {:>11.4} {:>9}",
+        "{:<18} {:>7.3} {:>6.2} {:>9.3} {:>12.4e} {:>10.4} {:>9} {:>9} {:>9} {:>8} {:>7} {:>7} {:>7} {:>7}",
         integrator.display_name(),
         1_000.0 * scenario.fixed_time_step * timestep_scale,
         air_damping_rate,
+        metrics.elapsed.as_secs_f64() * 1_000.0,
         metrics.final_diagnostics.total_mechanical_energy,
-        metrics.final_diagnostics.kinetic_energy,
-        metrics.final_diagnostics.maximum_node_speed,
-        metrics.maximum_post_release_kinetic_energy,
-        metrics.maximum_post_release_speed,
+        metrics.maximum_node_speed,
+        metrics.final_diagnostics.nonlinear_iterations,
+        metrics.final_diagnostics.residual_evaluations,
+        metrics.final_diagnostics.jacobian_assemblies,
+        metrics.final_diagnostics.block_factorizations,
+        metrics.final_diagnostics.sparse_factorizations,
+        metrics.final_diagnostics.rejected_steps,
         metrics.final_diagnostics.adaptive_retries,
+        metrics.final_diagnostics.line_search_backtracks,
     );
     Ok(())
 }
 
-fn default_fixture_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/recorded-motion.json")
+fn default_fixture_paths() -> Result<Vec<PathBuf>, std::io::Error> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+    let mut paths: Vec<_> = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    paths.sort();
+    Ok(paths)
 }
 
 struct ReplayMetrics {
     final_diagnostics: Diagnostics,
-    maximum_post_release_kinetic_energy: f64,
-    maximum_post_release_speed: f64,
+    maximum_node_speed: f64,
+    elapsed: Duration,
 }
 
 fn replay(
@@ -87,19 +129,10 @@ fn replay(
     config.integrator = integrator;
     config.air_damping_rate = air_damping_rate;
     let mut simulation = Simulation::new(config)?;
-    let release_time = scenario
-        .commands
-        .iter()
-        .filter_map(|timed| match timed.command {
-            MotionCommand::Release { .. } => Some(timed.time),
-            _ => None,
-        })
-        .next_back()
-        .unwrap_or(scenario.duration);
     let base_timestep = scenario.fixed_time_step * timestep_scale;
     let mut next_command = 0;
-    let mut maximum_post_release_kinetic_energy = 0.0_f64;
-    let mut maximum_post_release_speed = 0.0_f64;
+    let mut maximum_node_speed = 0.0_f64;
+    let start = Instant::now();
 
     while simulation.diagnostics().simulation_time + TIME_EPSILON < scenario.duration {
         apply_due_commands(scenario, &mut simulation, &mut next_command)?;
@@ -108,20 +141,16 @@ fn replay(
         let substeps = simulation.recommended_substeps(outer_dt)?;
         let dt = outer_dt / substeps as f64;
         for _ in 0..substeps {
-            let diagnostics = simulation.step(dt)?;
-            if diagnostics.simulation_time + TIME_EPSILON >= release_time {
-                maximum_post_release_kinetic_energy =
-                    maximum_post_release_kinetic_energy.max(diagnostics.kinetic_energy);
-                maximum_post_release_speed =
-                    maximum_post_release_speed.max(diagnostics.maximum_node_speed);
-            }
+            simulation.step_without_diagnostics(dt)?;
         }
+        let diagnostics = simulation.diagnostics();
+        maximum_node_speed = maximum_node_speed.max(diagnostics.maximum_node_speed);
     }
 
     Ok(ReplayMetrics {
         final_diagnostics: simulation.diagnostics(),
-        maximum_post_release_kinetic_energy,
-        maximum_post_release_speed,
+        maximum_node_speed,
+        elapsed: start.elapsed(),
     })
 }
 
@@ -135,11 +164,13 @@ fn apply_due_commands(
         && scenario.commands[*next_command].time <= time + TIME_EPSILON
     {
         match scenario.commands[*next_command].command {
-            MotionCommand::SetTarget(target) => simulation.set_payload_target(Some(target)),
-            MotionCommand::InterpolateTarget { target, duration } => {
-                simulation.interpolate_payload_target(target, duration)?;
+            MotionCommand::SetTarget(target) => {
+                simulation.set_manipulation_target(target);
             }
-            MotionCommand::Release { velocity } => simulation.release_payload(velocity),
+            MotionCommand::InterpolateTarget { target, .. } => {
+                simulation.set_manipulation_target(target);
+            }
+            MotionCommand::Release { velocity } => simulation.release_manipulation(velocity),
         }
         *next_command += 1;
     }

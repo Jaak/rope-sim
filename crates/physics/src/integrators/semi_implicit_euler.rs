@@ -62,10 +62,11 @@ impl TimeIntegrator for SemiImplicitEuler {
     fn recommended_substeps(
         &self,
         system: &dyn DynamicalSystem,
+        state: &State,
         outer_dt: f64,
     ) -> Result<usize, StepError> {
         validate_timestep(outer_dt)?;
-        let maximum_dt = system.explicit_stable_timestep();
+        let maximum_dt = system.explicit_stable_timestep(state);
         Ok((outer_dt / maximum_dt).ceil().max(1.0) as usize)
     }
 }

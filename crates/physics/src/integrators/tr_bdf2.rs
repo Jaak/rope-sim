@@ -180,6 +180,7 @@ impl TimeIntegrator for TrBdf2 {
     fn recommended_substeps(
         &self,
         system: &dyn DynamicalSystem,
+        _state: &State,
         outer_dt: f64,
     ) -> Result<usize, StepError> {
         validate_timestep(outer_dt)?;
@@ -273,6 +274,7 @@ impl StageSolver {
         let mut last_residual = f64::INFINITY;
         for iteration in 0..MAX_NEWTON_ITERATIONS {
             statistics.nonlinear_iterations += 1;
+            statistics.residual_evaluations += 1;
             evaluate_residual(
                 system,
                 material_base,
@@ -302,14 +304,14 @@ impl StageSolver {
                 dt,
                 &mut self.acceleration_jacobian,
             );
+            statistics.jacobian_assemblies += 1;
             if self
                 .block_solver
-                .solve(
+                .factorize(
                     &self.acceleration_jacobian,
                     &self.node_to_unknown,
-                    &self.residual,
+                    self.dynamic_nodes.len(),
                     dt,
-                    &mut self.delta,
                 )
                 .is_err()
             {
@@ -328,6 +330,10 @@ impl StageSolver {
                     &mut self.jacobian_matrix,
                     &mut self.symbolic_lu,
                 )?;
+                statistics.sparse_factorizations += 1;
+            } else {
+                self.block_solver.solve(&self.residual, &mut self.delta)?;
+                statistics.block_factorizations += 1;
             }
             statistics.linear_solves += 1;
 
@@ -342,6 +348,7 @@ impl StageSolver {
                         self.base_unknowns[index] + step_scale * self.delta[index],
                     );
                 }
+                statistics.residual_evaluations += 1;
                 evaluate_residual(
                     system,
                     material_base,
@@ -358,6 +365,7 @@ impl StageSolver {
                     accepted = true;
                     break;
                 }
+                statistics.line_search_backtracks += 1;
                 step_scale *= 0.5;
             }
             if !accepted {
