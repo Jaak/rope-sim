@@ -1,6 +1,6 @@
 use crate::math::Vec2;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KinematicTarget {
     pub position: Vec2,
     pub velocity: Vec2,

@@ -1,18 +1,25 @@
+use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2 as EguiVec2,
 };
 use ropesim_physics::{
-    Diagnostics, IntegratorKind, KinematicTarget, ReconfigureOutcome, RopeModelKind, Simulation,
-    SimulationConfig, Vec2,
+    Diagnostics, IntegratorKind, KinematicTarget, MotionCommand, ReconfigureOutcome, RopeModelKind,
+    Simulation, SimulationConfig, Vec2,
 };
+
+mod scenario;
+
+use scenario::ScenarioController;
 
 const DEFAULT_FIXED_DT: f64 = 1.0 / 240.0;
 const MAX_FRAME_DT: f64 = 0.1;
 const MAX_STEPS_PER_FRAME: usize = 32;
 const PAYLOAD_RADIUS: f32 = 13.0;
 const GRAB_RADIUS: f32 = 24.0;
+const SCENARIO_DIRECTORY: &str = "scenarios";
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -43,6 +50,9 @@ struct RopeSimApp {
     viewport_id: Option<egui::Id>,
     previous_drag_position: Option<Vec2>,
     drag_velocity: Vec2,
+    scenarios: ScenarioController,
+    scenario_name: String,
+    scenario_status: Option<String>,
     error_message: Option<String>,
 }
 
@@ -70,6 +80,9 @@ impl RopeSimApp {
             viewport_id: None,
             previous_drag_position: None,
             drag_velocity: Vec2::ZERO,
+            scenarios: ScenarioController::default(),
+            scenario_name: "recorded-motion".to_owned(),
+            scenario_status: None,
             error_message: None,
         }
     }
@@ -77,227 +90,331 @@ impl RopeSimApp {
     fn controls(&mut self, root_ui: &mut egui::Ui) {
         let previous_config = self.config;
         let mut reset_requested = false;
+        let mut scenario_replay_started = false;
 
         egui::Panel::left("controls")
             .resizable(false)
             .exact_size(290.0)
             .show(root_ui, |ui| {
-                ui.heading("RopeSim");
-                ui.label(format!(
-                    "{} · {}",
-                    self.config.rope_model.display_name(),
-                    self.config.integrator.display_name()
-                ));
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    let pause_label = if self.paused { "Resume" } else { "Pause" };
-                    if ui
-                        .button(pause_label)
-                        .on_hover_text("Shortcut: Space")
-                        .clicked()
-                    {
-                        self.toggle_paused();
-                    }
-                    if ui
-                        .add_enabled(self.paused, egui::Button::new("Single step"))
-                        .on_hover_text("Shortcut: Right Arrow")
-                        .clicked()
-                    {
-                        self.request_single_step();
-                    }
-                    if ui.button("Reset").clicked() {
-                        reset_requested = true;
-                    }
-                });
-
-                ui.separator();
-                ui.heading("Rope");
-                ui.add(egui::Slider::new(&mut self.config.segment_count, 1..=64).text("Pieces"));
-                ui.add(
-                    egui::Slider::new(&mut self.config.rope_length, 2.0..=30.0).text("Length (m)"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.config.rope_mass, 0.2..=10.0)
-                        .logarithmic(true)
-                        .text("Rope mass (kg)"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.config.payload_mass, 10.0..=200.0)
-                        .logarithmic(true)
-                        .text("Payload (kg)"),
-                );
-
-                ui.separator();
-                ui.heading("Material and environment");
-                egui::ComboBox::from_id_salt("rope_model")
-                    .selected_text(self.config.rope_model.display_name())
-                    .show_ui(ui, |ui| {
-                        for model in RopeModelKind::ALL {
-                            ui.selectable_value(
-                                &mut self.config.rope_model,
-                                model,
-                                model.display_name(),
-                            );
-                        }
-                    });
-                let rigidity_label = if self.config.rope_model == RopeModelKind::StandardLinearSolid
-                {
-                    "Relaxed rigidity EA_inf (N)"
-                } else {
-                    "Axial rigidity EA (N)"
-                };
-                ui.add(
-                    egui::Slider::new(&mut self.config.axial_rigidity, 1_000.0..=100_000.0)
-                        .logarithmic(true)
-                        .text(rigidity_label),
-                );
-                if self.config.rope_model == RopeModelKind::StandardLinearSolid {
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.config.transient_axial_rigidity,
-                            100.0..=100_000.0,
-                        )
-                        .logarithmic(true)
-                        .text("Transient rigidity EA_1 (N)"),
-                    );
-                }
-                if matches!(
-                    self.config.rope_model,
-                    RopeModelKind::KelvinVoigt | RopeModelKind::StandardLinearSolid
-                ) {
-                    ui.add(
-                        egui::Slider::new(&mut self.config.axial_viscosity, 0.01..=1_000_000.0)
-                            .logarithmic(true)
-                            .text("Axial viscosity eta*A (N*s)"),
-                    );
-                }
-                if self.config.rope_model == RopeModelKind::StandardLinearSolid {
-                    ui.small(format!(
-                        "Relaxation time: {:.3} s",
-                        self.config.axial_viscosity / self.config.transient_axial_rigidity
-                    ));
-                }
-                ui.add(
-                    egui::Slider::new(&mut self.config.air_damping_rate, 0.0..=5.0)
-                        .text("Air damping (1/s)"),
-                );
-
-                let mut gravity_magnitude = -self.config.gravity.y;
-                if ui
-                    .add(
-                        egui::Slider::new(&mut gravity_magnitude, 0.0..=20.0)
-                            .text("Gravity (m/s²)"),
-                    )
-                    .changed()
-                {
-                    self.config.gravity.y = -gravity_magnitude;
-                }
-
-                ui.separator();
-                ui.heading("Numerics");
-                egui::ComboBox::from_id_salt("integrator")
-                    .selected_text(self.config.integrator.display_name())
-                    .show_ui(ui, |ui| {
-                        for integrator in IntegratorKind::ALL {
-                            ui.selectable_value(
-                                &mut self.config.integrator,
-                                integrator,
-                                integrator.display_name(),
-                            );
-                        }
-                    });
-
-                ui.separator();
-                ui.heading("Playback");
-                ui.add(egui::Slider::new(&mut self.time_scale, 0.1..=2.0).text("Time scale"));
-                ui.label(format!("Fixed step: {:.3} ms", DEFAULT_FIXED_DT * 1000.0));
-                ui.label(format!(
-                    "Automatic substeps: {} (effective {:.3} ms)",
-                    self.integration_substeps,
-                    DEFAULT_FIXED_DT * 1000.0 / self.integration_substeps as f64
-                ));
-
-                ui.separator();
-                ui.heading("Diagnostics");
-                egui::Grid::new("diagnostics_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 3.0])
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        diagnostic_row(ui, "Time", self.diagnostics.simulation_time, "s");
-                        diagnostic_row(ui, "Kinetic", self.diagnostics.kinetic_energy, "J");
-                        diagnostic_row(ui, "Elastic", self.diagnostics.elastic_energy, "J");
-                        diagnostic_row(ui, "Gravity", self.diagnostics.gravitational_energy, "J");
-                        diagnostic_row(ui, "Total", self.diagnostics.total_mechanical_energy, "J");
-                        diagnostic_row(
-                            ui,
-                            "Max tension strain",
-                            100.0 * self.diagnostics.maximum_tensile_strain,
-                            "%",
+                        ui.heading("RopeSim");
+                        ui.label(format!(
+                            "{} · {}",
+                            self.config.rope_model.display_name(),
+                            self.config.integrator.display_name()
+                        ));
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            let pause_label = if self.paused { "Resume" } else { "Pause" };
+                            if ui
+                                .button(pause_label)
+                                .on_hover_text("Shortcut: Space")
+                                .clicked()
+                            {
+                                self.toggle_paused();
+                            }
+                            if ui
+                                .add_enabled(self.paused, egui::Button::new("Single step"))
+                                .on_hover_text("Shortcut: Right Arrow")
+                                .clicked()
+                            {
+                                self.request_single_step();
+                            }
+                            if ui.button("Reset").clicked() {
+                                reset_requested = true;
+                            }
+                        });
+
+                        ui.separator();
+                        ui.heading("Rope");
+                        ui.add(
+                            egui::Slider::new(&mut self.config.segment_count, 1..=64)
+                                .text("Pieces"),
                         );
-                        diagnostic_row(
-                            ui,
-                            "Min segment",
-                            self.diagnostics.minimum_segment_length,
-                            "m",
+                        ui.add(
+                            egui::Slider::new(&mut self.config.rope_length, 2.0..=30.0)
+                                .text("Length (m)"),
                         );
-                        diagnostic_row(ui, "Max speed", self.diagnostics.maximum_node_speed, "m/s");
-                        diagnostic_row(
-                            ui,
-                            "Endpoint power",
-                            self.diagnostics.prescribed_endpoint_power,
-                            "W",
+                        ui.add(
+                            egui::Slider::new(&mut self.config.rope_mass, 0.2..=10.0)
+                                .logarithmic(true)
+                                .text("Rope mass (kg)"),
                         );
-                        diagnostic_row(
-                            ui,
-                            "Endpoint work",
-                            self.diagnostics.cumulative_prescribed_work,
-                            "J",
+                        ui.add(
+                            egui::Slider::new(&mut self.config.payload_mass, 10.0..=200.0)
+                                .logarithmic(true)
+                                .text("Payload (kg)"),
                         );
-                        diagnostic_row(
-                            ui,
-                            "Rejected steps",
-                            self.diagnostics.rejected_steps as f64,
-                            "",
+
+                        ui.separator();
+                        ui.heading("Material and environment");
+                        egui::ComboBox::from_id_salt("rope_model")
+                            .selected_text(self.config.rope_model.display_name())
+                            .show_ui(ui, |ui| {
+                                for model in RopeModelKind::ALL {
+                                    ui.selectable_value(
+                                        &mut self.config.rope_model,
+                                        model,
+                                        model.display_name(),
+                                    );
+                                }
+                            });
+                        let rigidity_label =
+                            if self.config.rope_model == RopeModelKind::StandardLinearSolid {
+                                "Relaxed rigidity EA_inf (N)"
+                            } else {
+                                "Axial rigidity EA (N)"
+                            };
+                        ui.add(
+                            egui::Slider::new(&mut self.config.axial_rigidity, 1_000.0..=100_000.0)
+                                .logarithmic(true)
+                                .text(rigidity_label),
                         );
-                        diagnostic_row(
-                            ui,
-                            "Linear solves",
-                            self.diagnostics.linear_solves as f64,
-                            "",
+                        if self.config.rope_model == RopeModelKind::StandardLinearSolid {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.config.transient_axial_rigidity,
+                                    100.0..=100_000.0,
+                                )
+                                .logarithmic(true)
+                                .text("Transient rigidity EA_1 (N)"),
+                            );
+                        }
+                        if matches!(
+                            self.config.rope_model,
+                            RopeModelKind::KelvinVoigt | RopeModelKind::StandardLinearSolid
+                        ) {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.config.axial_viscosity,
+                                    0.01..=1_000_000.0,
+                                )
+                                .logarithmic(true)
+                                .text("Axial viscosity eta*A (N*s)"),
+                            );
+                        }
+                        if self.config.rope_model == RopeModelKind::StandardLinearSolid {
+                            ui.small(format!(
+                                "Relaxation time: {:.3} s",
+                                self.config.axial_viscosity / self.config.transient_axial_rigidity
+                            ));
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut self.config.air_damping_rate, 0.0..=5.0)
+                                .text("Air damping (1/s)"),
                         );
-                        diagnostic_row(
-                            ui,
-                            "Newton iterations",
-                            self.diagnostics.nonlinear_iterations as f64,
-                            "",
+
+                        let mut gravity_magnitude = -self.config.gravity.y;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut gravity_magnitude, 0.0..=20.0)
+                                    .text("Gravity (m/s²)"),
+                            )
+                            .changed()
+                        {
+                            self.config.gravity.y = -gravity_magnitude;
+                        }
+
+                        ui.separator();
+                        ui.heading("Numerics");
+                        egui::ComboBox::from_id_salt("integrator")
+                            .selected_text(self.config.integrator.display_name())
+                            .show_ui(ui, |ui| {
+                                for integrator in IntegratorKind::ALL {
+                                    ui.selectable_value(
+                                        &mut self.config.integrator,
+                                        integrator,
+                                        integrator.display_name(),
+                                    );
+                                }
+                            });
+
+                        ui.separator();
+                        ui.heading("Playback");
+                        ui.add(
+                            egui::Slider::new(&mut self.time_scale, 0.1..=2.0).text("Time scale"),
                         );
-                        diagnostic_row(
-                            ui,
-                            "Adaptive retries",
-                            self.diagnostics.adaptive_retries as f64,
-                            "",
+                        ui.label(format!("Fixed step: {:.3} ms", DEFAULT_FIXED_DT * 1000.0));
+                        ui.label(format!(
+                            "Automatic substeps: {} (effective {:.3} ms)",
+                            self.integration_substeps,
+                            DEFAULT_FIXED_DT * 1000.0 / self.integration_substeps as f64
+                        ));
+
+                        ui.separator();
+                        ui.heading("Recorded scenario");
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.scenarios.is_active(),
+                                    egui::Button::new("Record"),
+                                )
+                                .on_hover_text("Reset and record configuration plus payload motion")
+                                .clicked()
+                            {
+                                self.start_scenario_recording();
+                            }
+                            if ui
+                                .add_enabled(self.scenarios.is_active(), egui::Button::new("Stop"))
+                                .clicked()
+                            {
+                                self.stop_scenario_activity();
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.scenarios.has_recording() && !self.scenarios.is_active(),
+                                    egui::Button::new("Replay"),
+                                )
+                                .on_hover_text("Replay with the currently selected integrator")
+                                .clicked()
+                            {
+                                self.start_scenario_replay();
+                                scenario_replay_started = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Fixture name");
+                            ui.text_edit_singleline(&mut self.scenario_name);
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.scenarios.has_recording() && !self.scenarios.is_active(),
+                                    egui::Button::new("Save JSON"),
+                                )
+                                .clicked()
+                            {
+                                self.save_recorded_scenario();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.scenarios.is_active(),
+                                    egui::Button::new("Load JSON"),
+                                )
+                                .clicked()
+                            {
+                                self.load_recorded_scenario();
+                            }
+                        });
+                        if self.scenarios.is_recording() {
+                            ui.colored_label(Color32::from_rgb(235, 95, 95), "Recording...");
+                        } else if self.scenarios.is_replaying() {
+                            ui.colored_label(Color32::from_rgb(100, 180, 240), "Replaying...");
+                        } else if let Some((duration, command_count)) =
+                            self.scenarios.recording_summary()
+                        {
+                            ui.small(format!(
+                                "Saved in memory: {duration:.2} s, {command_count} commands"
+                            ));
+                        } else {
+                            ui.small("Record starts from a reset state.");
+                        }
+                        if let Some(status) = &self.scenario_status {
+                            ui.small(status);
+                        }
+
+                        ui.separator();
+                        ui.heading("Diagnostics");
+                        egui::Grid::new("diagnostics_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 3.0])
+                            .show(ui, |ui| {
+                                diagnostic_row(ui, "Time", self.diagnostics.simulation_time, "s");
+                                diagnostic_row(ui, "Kinetic", self.diagnostics.kinetic_energy, "J");
+                                diagnostic_row(ui, "Elastic", self.diagnostics.elastic_energy, "J");
+                                diagnostic_row(
+                                    ui,
+                                    "Gravity",
+                                    self.diagnostics.gravitational_energy,
+                                    "J",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Total",
+                                    self.diagnostics.total_mechanical_energy,
+                                    "J",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Max tension strain",
+                                    100.0 * self.diagnostics.maximum_tensile_strain,
+                                    "%",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Min segment",
+                                    self.diagnostics.minimum_segment_length,
+                                    "m",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Max speed",
+                                    self.diagnostics.maximum_node_speed,
+                                    "m/s",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Endpoint power",
+                                    self.diagnostics.prescribed_endpoint_power,
+                                    "W",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Endpoint work",
+                                    self.diagnostics.cumulative_prescribed_work,
+                                    "J",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Rejected steps",
+                                    self.diagnostics.rejected_steps as f64,
+                                    "",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Linear solves",
+                                    self.diagnostics.linear_solves as f64,
+                                    "",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Newton iterations",
+                                    self.diagnostics.nonlinear_iterations as f64,
+                                    "",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Adaptive retries",
+                                    self.diagnostics.adaptive_retries as f64,
+                                    "",
+                                );
+                                diagnostic_row(
+                                    ui,
+                                    "Timestep",
+                                    self.diagnostics.explicit_stable_timestep * 1000.0,
+                                    "ms",
+                                );
+                            });
+
+                        ui.add_space(8.0);
+                        ui.small(
+                            "Drag the payload directly. Its mouse velocity is retained on release.",
                         );
-                        diagnostic_row(
-                            ui,
-                            "Timestep",
-                            self.diagnostics.explicit_stable_timestep * 1000.0,
-                            "ms",
-                        );
+
+                        if let Some(message) = &self.error_message {
+                            ui.add_space(8.0);
+                            ui.colored_label(Color32::LIGHT_RED, message);
+                        }
                     });
-
-                ui.add_space(8.0);
-                ui.small("Drag the payload directly. Its mouse velocity is retained on release.");
-
-                if let Some(message) = &self.error_message {
-                    ui.add_space(8.0);
-                    ui.colored_label(Color32::LIGHT_RED, message);
-                }
             });
 
         if reset_requested {
             self.reset_simulation();
-        } else if self.config != previous_config {
+        } else if self.config != previous_config && !scenario_replay_started {
+            self.stop_scenario_activity();
             match self.simulation.reconfigure(self.config) {
                 Ok(ReconfigureOutcome::Updated) => {
                     self.diagnostics = self.simulation.diagnostics();
@@ -401,6 +518,10 @@ impl RopeSimApp {
     }
 
     fn update_drag(&mut self, response: &egui::Response, transform: ViewTransform, frame_dt: f64) {
+        if self.scenarios.is_replaying() {
+            return;
+        }
+
         let pointer_position = response.interact_pointer_pos();
         if response.drag_started()
             && pointer_position.is_some_and(|pointer| {
@@ -429,6 +550,10 @@ impl RopeSimApp {
                 let target = KinematicTarget::new(world_position, self.drag_velocity);
                 if self.paused {
                     self.simulation.set_payload_target(Some(target));
+                    self.scenarios.record(
+                        self.diagnostics.simulation_time,
+                        MotionCommand::SetTarget(target),
+                    );
                 } else {
                     let base_duration =
                         (frame_dt.min(MAX_FRAME_DT) * self.time_scale).max(DEFAULT_FIXED_DT);
@@ -437,6 +562,14 @@ impl RopeSimApp {
                         .interpolate_payload_target(target, base_duration)
                     {
                         self.error_message = Some(error.to_string());
+                    } else {
+                        self.scenarios.record(
+                            self.diagnostics.simulation_time,
+                            MotionCommand::InterpolateTarget {
+                                target,
+                                duration: base_duration,
+                            },
+                        );
                     }
                 }
             }
@@ -445,6 +578,12 @@ impl RopeSimApp {
             self.previous_drag_position = None;
             let release_velocity = self.simulation.payload_velocity();
             self.simulation.release_payload(release_velocity);
+            self.scenarios.record(
+                self.diagnostics.simulation_time,
+                MotionCommand::Release {
+                    velocity: release_velocity,
+                },
+            );
         }
     }
 
@@ -463,6 +602,19 @@ impl RopeSimApp {
 
         let mut steps = 0;
         while self.accumulator >= DEFAULT_FIXED_DT && steps < MAX_STEPS_PER_FRAME {
+            if let Err(error) = self.apply_due_replay_commands() {
+                self.recover_from_step_error(error);
+                return;
+            }
+            if self
+                .scenarios
+                .finish_replay_if_complete(self.diagnostics.simulation_time)
+            {
+                self.paused = true;
+                self.accumulator = 0.0;
+                break;
+            }
+
             self.integration_substeps = match self.simulation.recommended_substeps(DEFAULT_FIXED_DT)
             {
                 Ok(substeps) => substeps,
@@ -491,6 +643,15 @@ impl RopeSimApp {
             self.error_message = None;
             self.accumulator -= DEFAULT_FIXED_DT;
             steps += 1;
+
+            if self
+                .scenarios
+                .finish_replay_if_complete(self.diagnostics.simulation_time)
+            {
+                self.paused = true;
+                self.accumulator = 0.0;
+                break;
+            }
         }
 
         if steps == MAX_STEPS_PER_FRAME {
@@ -573,7 +734,100 @@ impl RopeSimApp {
         );
     }
 
+    fn start_scenario_recording(&mut self) {
+        self.reset_simulation();
+        self.scenarios
+            .begin_recording(self.config, DEFAULT_FIXED_DT);
+        self.scenario_status = None;
+        self.paused = false;
+        self.single_step_requested = false;
+    }
+
+    fn start_scenario_replay(&mut self) {
+        let selected_integrator = self.config.integrator;
+        let Some(recorded_config) = self.scenarios.recorded_config_for(selected_integrator) else {
+            return;
+        };
+
+        self.config = recorded_config;
+        self.reset_simulation();
+        if self.scenarios.begin_replay() {
+            self.paused = false;
+            self.single_step_requested = false;
+        }
+    }
+
+    fn stop_scenario_activity(&mut self) {
+        self.scenarios.stop(self.diagnostics.simulation_time);
+    }
+
+    fn save_recorded_scenario(&mut self) {
+        let result = (|| {
+            let path = scenario_path(&self.scenario_name)?;
+            let json = self
+                .scenarios
+                .saved_json()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "there is no recorded scenario to save".to_owned())?;
+            fs::create_dir_all(SCENARIO_DIRECTORY)
+                .map_err(|error| format!("could not create scenario directory: {error}"))?;
+            fs::write(&path, json)
+                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+            Ok::<_, String>(path)
+        })();
+
+        match result {
+            Ok(path) => {
+                self.scenario_status = Some(format!("Saved {}", path.display()));
+                self.error_message = None;
+            }
+            Err(error) => self.error_message = Some(error),
+        }
+    }
+
+    fn load_recorded_scenario(&mut self) {
+        let result = (|| {
+            let path = scenario_path(&self.scenario_name)?;
+            let json = fs::read_to_string(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            self.scenarios
+                .load_json(&json)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(path)
+        })();
+
+        match result {
+            Ok(path) => {
+                self.scenario_status = Some(format!("Loaded {}", path.display()));
+                self.error_message = None;
+            }
+            Err(error) => self.error_message = Some(error),
+        }
+    }
+
+    fn apply_due_replay_commands(&mut self) -> Result<(), String> {
+        for command in self
+            .scenarios
+            .take_due_commands(self.diagnostics.simulation_time)
+        {
+            match command {
+                MotionCommand::SetTarget(target) => {
+                    self.simulation.set_payload_target(Some(target));
+                }
+                MotionCommand::InterpolateTarget { target, duration } => self
+                    .simulation
+                    .interpolate_payload_target(target, duration)
+                    .map_err(|error| error.to_string())?,
+                MotionCommand::Release { velocity } => {
+                    self.simulation.release_payload(velocity);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn reset_simulation(&mut self) {
+        self.stop_scenario_activity();
         self.simulation =
             Simulation::new(self.config).expect("slider-constrained configuration must be valid");
         self.after_simulation_reset();
@@ -593,6 +847,7 @@ impl RopeSimApp {
     }
 
     fn recover_from_step_error(&mut self, error: String) {
+        self.stop_scenario_activity();
         self.simulation =
             Simulation::new(self.config).expect("slider-constrained configuration must be valid");
         self.after_simulation_reset();
@@ -653,6 +908,19 @@ impl ViewTransform {
     }
 }
 
+fn scenario_path(name: &str) -> Result<PathBuf, String> {
+    let trimmed = name.trim();
+    let stem = trimmed.strip_suffix(".json").unwrap_or(trimmed);
+    if stem.is_empty()
+        || !stem
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("fixture name must contain only ASCII letters, numbers, '-' or '_'".to_owned());
+    }
+    Ok(PathBuf::from(SCENARIO_DIRECTORY).join(format!("{stem}.json")))
+}
+
 fn diagnostic_row(ui: &mut egui::Ui, name: &str, value: f64, unit: &str) {
     ui.label(name);
     ui.monospace(format_diagnostic(value, unit));
@@ -683,7 +951,9 @@ fn paint_dotted_circle(painter: &egui::Painter, center: Pos2, radius: f32, color
 
 #[cfg(test)]
 mod tests {
-    use super::format_diagnostic;
+    use std::path::PathBuf;
+
+    use super::{format_diagnostic, scenario_path};
 
     #[test]
     fn huge_diagnostics_use_bounded_scientific_notation() {
@@ -695,5 +965,15 @@ mod tests {
     #[test]
     fn non_finite_diagnostics_have_a_bounded_label() {
         assert_eq!(format_diagnostic(f64::INFINITY, "W").trim(), "non-finite W");
+    }
+
+    #[test]
+    fn scenario_names_cannot_escape_the_fixture_directory() {
+        assert_eq!(
+            scenario_path("rapid-drag.json").unwrap(),
+            PathBuf::from("scenarios").join("rapid-drag.json")
+        );
+        assert!(scenario_path("../outside").is_err());
+        assert!(scenario_path("nested/name").is_err());
     }
 }

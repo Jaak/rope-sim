@@ -4,7 +4,8 @@ use std::fmt;
 use crate::integrators::IntegratorKind;
 use crate::math::Vec2;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RopeModelKind {
     #[default]
     HookeSpring,
@@ -29,7 +30,7 @@ impl RopeModelKind {
 }
 
 /// Configuration shared by all frontends.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SimulationConfig {
     /// Number of axial elements. The node count is one greater.
     pub segment_count: usize,

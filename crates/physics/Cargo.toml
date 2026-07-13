@@ -10,3 +10,5 @@ name = "ropesim_physics"
 
 [dependencies]
 faer = { version = "0.24.4", default-features = false, features = ["std", "sparse-linalg"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
