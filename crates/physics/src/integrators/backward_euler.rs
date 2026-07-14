@@ -14,7 +14,7 @@ use super::{
 
 const MAX_NEWTON_ITERATIONS: usize = 12;
 const MAX_LINE_SEARCH_ITERATIONS: usize = 10;
-const MAX_ADAPTIVE_RETRY_LEVELS: usize = 4;
+const MAX_ADAPTIVE_RETRY_LEVELS: usize = 6;
 const RESIDUAL_TOLERANCE: f64 = 1.0e-8;
 const INTERACTION_RESIDUAL_TOLERANCE: f64 = 1.0e-5;
 const NOT_DYNAMIC: usize = usize::MAX;

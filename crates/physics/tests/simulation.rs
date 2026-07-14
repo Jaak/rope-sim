@@ -1318,7 +1318,7 @@ fn advance_prescribed_experiment(
 fn backward_euler_handles_the_maximum_ui_piece_count() {
     let dt = 1.0 / 240.0;
     let mut simulation = Simulation::new(SimulationConfig {
-        segment_count: 64,
+        segment_count: 512,
         integrator: IntegratorKind::BackwardEuler,
         ..SimulationConfig::default()
     })
@@ -1337,7 +1337,7 @@ fn backward_euler_handles_the_maximum_ui_piece_count() {
 }
 
 #[test]
-fn rk4_handles_the_maximum_ui_piece_count_with_recommended_substeps() {
+fn rk4_handles_64_pieces_with_recommended_substeps() {
     let dt = 1.0 / 240.0;
     let mut simulation = Simulation::new(SimulationConfig {
         segment_count: 64,

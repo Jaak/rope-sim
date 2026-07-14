@@ -1,3 +1,4 @@
+use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -8,18 +9,29 @@ use ropesim_physics::{
 const DT: f64 = 1.0 / 240.0;
 const WARMUP_STEPS: usize = 60;
 const TIMED_STEPS: usize = 180;
+const PROFILE_STEPS: usize = 2_400;
 const SEGMENT_COUNTS: [usize; 4] = [64, 256, 512, 1_024];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(argument) = env::args().nth(1) {
+        match argument.as_str() {
+            "--profile-hybrid" => return profile_hybrid(false),
+            "--profile-bending" => return profile_hybrid(true),
+            _ => return Err(format!("unrecognized argument: {argument}").into()),
+        }
+    }
+
     println!("Run this benchmark with --release. Times are per 240 Hz physics step.");
     println!(
-        "{:<11} {:<10} {:>6} {:>10} {:>10} {:>10} {:>8} {:>9} {:>9} {:>11} {:>11}",
+        "{:<11} {:<10} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>9} {:>9} {:>11} {:>11}",
         "phase",
         "model",
         "links",
         "mean us",
         "p50 us",
         "p99 us",
+        "XPBD us",
+        "corr us",
         "substeps",
         "correct",
         "fallback",
@@ -66,6 +78,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &result,
         );
     }
+    for segment_count in SEGMENT_COUNTS {
+        let result = benchmark_free(segment_count, 0.0, IntegratorKind::TrBdf2)?;
+        print_result(
+            "free TR2",
+            RopeModelKind::StandardLinearSolid,
+            segment_count,
+            &result,
+        );
+    }
+    for segment_count in SEGMENT_COUNTS {
+        let result = benchmark_free(segment_count, 0.01, IntegratorKind::TrBdf2)?;
+        print_result(
+            "bend TR2",
+            RopeModelKind::StandardLinearSolid,
+            segment_count,
+            &result,
+        );
+    }
     for segment_count in [20, 40, 64] {
         let result = benchmark_free(segment_count, 0.01, IntegratorKind::RungeKutta4)?;
         print_result(
@@ -78,8 +108,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn profile_hybrid(bending: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let bending_rigidity = if bending { 0.01 } else { 0.0 };
+    let mut simulation = Simulation::new(SimulationConfig {
+        segment_count: 1_024,
+        rope_model: RopeModelKind::StandardLinearSolid,
+        bending_rigidity,
+        bending_viscosity: 0.1 * bending_rigidity,
+        integrator: IntegratorKind::TrBdf2,
+        ..SimulationConfig::default()
+    })?;
+
+    for step in 0..WARMUP_STEPS + PROFILE_STEPS {
+        simulation.set_manipulation_target(drag_target(step));
+        simulation.step_without_diagnostics(black_box(DT))?;
+        black_box(simulation.payload_position());
+    }
+
+    println!(
+        "profiled {PROFILE_STEPS} hybrid steps at 1,024 links ({})",
+        if bending {
+            "with bending"
+        } else {
+            "axial only"
+        },
+    );
+    Ok(())
+}
+
 struct BenchmarkResult {
     samples: Vec<Duration>,
+    xpbd_only_samples: Vec<Duration>,
+    correction_samples: Vec<Duration>,
     corrections: u64,
     fallbacks: u64,
     release: Option<Duration>,
@@ -107,19 +167,36 @@ fn benchmark_hybrid_drag(
     }
     let before = simulation.diagnostics();
     let mut samples = Vec::with_capacity(TIMED_STEPS);
+    let mut xpbd_only_samples = Vec::with_capacity(TIMED_STEPS / 2);
+    let mut correction_samples = Vec::with_capacity(TIMED_STEPS / 2);
     for step in WARMUP_STEPS..WARMUP_STEPS + TIMED_STEPS {
         simulation.set_manipulation_target(drag_target(step));
         let start = Instant::now();
         simulation.step_without_diagnostics(black_box(DT))?;
-        samples.push(start.elapsed());
+        let elapsed = start.elapsed();
+        samples.push(elapsed);
+        if (step + 1).is_multiple_of(2) {
+            correction_samples.push(elapsed);
+        } else {
+            xpbd_only_samples.push(elapsed);
+        }
     }
     let after = simulation.diagnostics();
+    assert_eq!(
+        after.manipulation_corrections - before.manipulation_corrections
+            + after.manipulation_correction_fallbacks
+            - before.manipulation_correction_fallbacks,
+        correction_samples.len() as u64,
+        "the benchmark's correction-step classification is out of date",
+    );
     let release_start = Instant::now();
     simulation.release_manipulation(drag_target(WARMUP_STEPS + TIMED_STEPS).velocity);
     let release = release_start.elapsed();
 
     Ok(BenchmarkResult {
         samples,
+        xpbd_only_samples,
+        correction_samples,
         corrections: after.manipulation_corrections - before.manipulation_corrections,
         fallbacks: after.manipulation_correction_fallbacks
             - before.manipulation_correction_fallbacks,
@@ -155,6 +232,8 @@ fn benchmark_free(
     }
     Ok(BenchmarkResult {
         samples,
+        xpbd_only_samples: Vec::new(),
+        correction_samples: Vec::new(),
         corrections: 0,
         fallbacks: 0,
         release: None,
@@ -209,11 +288,20 @@ fn print_result(
     let release = result
         .release
         .map_or(0.0, |duration| duration.as_secs_f64() * 1.0e6);
+    let mean_duration = |samples: &[Duration]| {
+        if samples.is_empty() {
+            0.0
+        } else {
+            samples.iter().map(Duration::as_secs_f64).sum::<f64>() * 1.0e6 / samples.len() as f64
+        }
+    };
     println!(
-        "{phase:<11} {:<10} {segment_count:>6} {mean:>10.1} {:>10.1} {:>10.1} {:>8} {:>9} {:>9} {:>11.2e} {release:>11.1}",
+        "{phase:<11} {:<10} {segment_count:>6} {mean:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>8} {:>9} {:>9} {:>11.2e} {release:>11.1}",
         short_model_name(rope_model),
         percentile(0.50),
         percentile(0.99),
+        mean_duration(&result.xpbd_only_samples),
+        mean_duration(&result.correction_samples),
         result.maximum_substeps,
         result.corrections,
         result.fallbacks,

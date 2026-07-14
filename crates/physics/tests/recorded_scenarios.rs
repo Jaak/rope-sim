@@ -62,6 +62,18 @@ fn replay_scenario(
     let mut maximum_node_speed = 0.0_f64;
     let mut maximum_speed_time = 0.0_f64;
     let mut maximum_speed_node = 0_usize;
+    let settling_probe_time = (path.file_stem().and_then(|name| name.to_str()) == Some("bug-5"))
+        .then(|| {
+            scenario
+                .commands
+                .iter()
+                .find_map(|timed| {
+                    matches!(timed.command, MotionCommand::Release { .. })
+                        .then_some(timed.time - 0.2)
+                })
+                .unwrap_or(scenario.duration)
+        });
+    let mut settling_probe_speed = None;
     // bug-4-1 records the slow-moving-boundary regression. Its final command
     // releases an 80 kg payload with roughly 11 m of slack below it; the later
     // free-fall/catch is a separate integrator stress case, not drag validation.
@@ -108,6 +120,13 @@ fn replay_scenario(
                 maximum_speed_time = simulation.diagnostics().simulation_time;
                 maximum_speed_node = current_speed_node;
             }
+            if settling_probe_speed.is_none()
+                && settling_probe_time.is_some_and(|probe| {
+                    simulation.diagnostics().simulation_time + TIME_EPSILON >= probe
+                })
+            {
+                settling_probe_speed = Some(current_speed);
+            }
         }
     }
     apply_due_commands(scenario, &mut simulation, &mut next_command)?;
@@ -141,6 +160,15 @@ fn replay_scenario(
     {
         return Err(format!(
             "{} reproduced its excessive boundary-driven speed of {maximum_node_speed:.3} m/s at node {maximum_speed_node}, t={maximum_speed_time:.3} with {}",
+            path.display(),
+            integrator.display_name()
+        ));
+    }
+    if let Some(speed) = settling_probe_speed
+        && speed >= 2.0
+    {
+        return Err(format!(
+            "{} retained an excessive node speed of {speed:.3} m/s after the final stationary hold with {}",
             path.display(),
             integrator.display_name()
         ));

@@ -4,6 +4,9 @@ RopeSim is a two-dimensional weighted-rope simulator. The project currently
 contains a platform-independent Rust physics library and a native `eframe`
 application.
 
+This has been implemented as a toy to experiment with different integrators
+and rope models. This has been largely implemented by sol 5.6.
+
 ## Run
 
 ```powershell
@@ -23,9 +26,15 @@ cargo run -p ropesim-physics --example hybrid_benchmark --release
 ```
 
 The benchmark reports mean, median, and p99 step times for hybrid SLS/QKV
-dragging and free backward Euler at 64, 256, 512, and 1,024 links. It includes
-axial-only and bending-enabled SLS paths, fully converged release-handoff time,
-and bounded-correction fallback counts.
+dragging and free backward Euler/TR-BDF2 at 64, 256, 512, and 1,024 links.
+Hybrid timings separate XPBD-only steps from steps that also run the bounded
+backward-Euler correction. It includes axial-only and bending-enabled SLS
+paths, fully converged release-handoff time, and bounded-correction fallback
+counts.
+
+For sampling profiles, pass `--profile-hybrid` or `--profile-bending` after
+the Cargo argument separator. Each mode runs 2,400 focused hybrid steps at
+1,024 links so a profiler does not combine unrelated benchmark cases.
 
 ## Dynamic-rope calibration fixture
 

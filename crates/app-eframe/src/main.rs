@@ -18,6 +18,7 @@ use scenario::ScenarioController;
 const DEFAULT_FIXED_DT: f64 = 1.0 / 240.0;
 const MAX_FRAME_DT: f64 = 0.1;
 const MAX_STEPS_PER_FRAME: usize = 32;
+const MAX_UI_SEGMENTS: usize = 512;
 const PAYLOAD_RADIUS: f32 = 13.0;
 const GRAB_RADIUS: f32 = 24.0;
 const SCENARIO_DIRECTORY: &str = "scenarios";
@@ -139,7 +140,11 @@ impl RopeSimApp {
                         ui.separator();
                         ui.heading("Rope");
                         ui.add(
-                            egui::Slider::new(&mut self.config.segment_count, 1..=64)
+                            egui::Slider::new(
+                                &mut self.config.segment_count,
+                                1..=MAX_UI_SEGMENTS,
+                            )
+                                .logarithmic(true)
                                 .text("Pieces"),
                         );
                         ui.add(

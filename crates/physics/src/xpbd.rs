@@ -13,6 +13,7 @@ const MINIMUM_MANIPULATION_DAMPING_RATE: f64 = 0.5;
 pub(crate) struct XpbdRopeRelaxer {
     multipliers: Vec<f64>,
     bending_multipliers: Vec<f64>,
+    velocity_projection: VelocityProjection,
 }
 
 impl XpbdRopeRelaxer {
@@ -20,6 +21,7 @@ impl XpbdRopeRelaxer {
         Self {
             multipliers: vec![0.0; node_count.saturating_sub(1)],
             bending_multipliers: vec![0.0; node_count.saturating_sub(2)],
+            velocity_projection: VelocityProjection::new(node_count.saturating_sub(1)),
         }
     }
 
@@ -63,7 +65,8 @@ impl XpbdRopeRelaxer {
         // velocities instead, so the held constraints can support gravity.
         state.velocities[0] = Vec2::ZERO;
         state.velocities[payload] = target.velocity;
-        project_velocities(state, masses, target.velocity, constraint_sweeps);
+        self.velocity_projection
+            .project(state, masses, target.velocity);
         damp_bending_velocities(config, state, masses, rest_length, target.velocity, dt);
         advance_material_state(config, state, rest_length, dt);
     }
@@ -150,6 +153,100 @@ impl XpbdRopeRelaxer {
         self.multipliers.resize(node_count.saturating_sub(1), 0.0);
         self.bending_multipliers
             .resize(node_count.saturating_sub(2), 0.0);
+        self.velocity_projection
+            .resize(node_count.saturating_sub(1));
+    }
+}
+
+/// Mass-weighted projection onto the axial velocity constraints.
+///
+/// The constraint-space matrix is scalar tridiagonal because neighboring rope
+/// elements share exactly one node. A tiny diagonal regularization selects a
+/// stable impulse when a perfectly straight rope makes the endpoint-held
+/// constraint system rank deficient; it has negligible effect on velocities.
+struct VelocityProjection {
+    directions: Vec<Vec2>,
+    diagonal: Vec<f64>,
+    upper: Vec<f64>,
+    right_hand_side: Vec<f64>,
+}
+
+impl VelocityProjection {
+    fn new(element_count: usize) -> Self {
+        Self {
+            directions: vec![Vec2::ZERO; element_count],
+            diagonal: vec![0.0; element_count],
+            upper: vec![0.0; element_count.saturating_sub(1)],
+            right_hand_side: vec![0.0; element_count],
+        }
+    }
+
+    fn resize(&mut self, element_count: usize) {
+        self.directions.resize(element_count, Vec2::ZERO);
+        self.diagonal.resize(element_count, 0.0);
+        self.upper.resize(element_count.saturating_sub(1), 0.0);
+        self.right_hand_side.resize(element_count, 0.0);
+    }
+
+    fn project(&mut self, state: &mut State, masses: &[f64], payload_velocity: Vec2) {
+        let element_count = state.node_count().saturating_sub(1);
+        if element_count == 0 {
+            return;
+        }
+        self.resize(element_count);
+        let payload = state.node_count() - 1;
+
+        for element in 0..element_count {
+            let delta = state.positions[element + 1] - state.positions[element];
+            let length = delta.length();
+            self.directions[element] = if length > f64::EPSILON {
+                delta / length
+            } else {
+                Vec2::ZERO
+            };
+        }
+        let mut maximum_diagonal = 0.0_f64;
+        for element in 0..element_count {
+            let left_inverse_mass = inverse_mass(masses, element, payload, true);
+            let right_inverse_mass = inverse_mass(masses, element + 1, payload, true);
+            let direction = self.directions[element];
+            self.diagonal[element] =
+                (left_inverse_mass + right_inverse_mass) * direction.length_squared();
+            maximum_diagonal = maximum_diagonal.max(self.diagonal[element]);
+            self.right_hand_side[element] =
+                -direction.dot(state.velocities[element + 1] - state.velocities[element]);
+            if element + 1 < element_count {
+                let shared_inverse_mass = right_inverse_mass;
+                self.upper[element] =
+                    -shared_inverse_mass * direction.dot(self.directions[element + 1]);
+            }
+        }
+
+        let regularization = maximum_diagonal.max(1.0) * 1.0e-12;
+        for diagonal in &mut self.diagonal {
+            *diagonal += regularization;
+        }
+        for index in 1..element_count {
+            let factor = self.upper[index - 1] / self.diagonal[index - 1];
+            self.diagonal[index] -= factor * self.upper[index - 1];
+            self.right_hand_side[index] -= factor * self.right_hand_side[index - 1];
+        }
+        self.right_hand_side[element_count - 1] /= self.diagonal[element_count - 1];
+        for index in (0..element_count - 1).rev() {
+            self.right_hand_side[index] = (self.right_hand_side[index]
+                - self.upper[index] * self.right_hand_side[index + 1])
+                / self.diagonal[index];
+        }
+
+        for element in 0..element_count {
+            let impulse = self.directions[element] * self.right_hand_side[element];
+            let left_inverse_mass = inverse_mass(masses, element, payload, true);
+            let right_inverse_mass = inverse_mass(masses, element + 1, payload, true);
+            state.velocities[element] -= impulse * left_inverse_mass;
+            state.velocities[element + 1] += impulse * right_inverse_mass;
+        }
+        state.velocities[0] = Vec2::ZERO;
+        state.velocities[payload] = payload_velocity;
     }
 }
 
@@ -289,49 +386,6 @@ fn advance_material_state(config: &SimulationConfig, state: &mut State, rest_len
     }
 }
 
-fn project_velocities(
-    state: &mut State,
-    masses: &[f64],
-    payload_velocity: Vec2,
-    constraint_sweeps: usize,
-) {
-    let payload = state.node_count() - 1;
-    for sweep in 0..constraint_sweeps {
-        if sweep.is_multiple_of(2) {
-            for element in 0..payload {
-                project_element_velocity(state, masses, element, payload);
-            }
-        } else {
-            for element in (0..payload).rev() {
-                project_element_velocity(state, masses, element, payload);
-            }
-        }
-        state.velocities[0] = Vec2::ZERO;
-        state.velocities[payload] = payload_velocity;
-    }
-}
-
-fn project_element_velocity(state: &mut State, masses: &[f64], element: usize, payload: usize) {
-    let left = element;
-    let right = element + 1;
-    let delta = state.positions[right] - state.positions[left];
-    let length = delta.length();
-    if length <= f64::EPSILON {
-        return;
-    }
-    let direction = delta / length;
-    let left_inverse_mass = inverse_mass(masses, left, payload, true);
-    let right_inverse_mass = inverse_mass(masses, right, payload, true);
-    let denominator = left_inverse_mass + right_inverse_mass;
-    if denominator <= 0.0 {
-        return;
-    }
-    let relative_speed = direction.dot(state.velocities[right] - state.velocities[left]);
-    let impulse = -relative_speed / denominator;
-    state.velocities[left] -= direction * (left_inverse_mass * impulse);
-    state.velocities[right] += direction * (right_inverse_mass * impulse);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn project_element(
     state: &mut State,
@@ -375,5 +429,47 @@ fn inverse_mass(masses: &[f64], node: usize, payload: usize, payload_is_held: bo
         0.0
     } else {
         1.0 / masses[node]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_velocity_projection_enforces_axial_constraints() {
+        for positions in [
+            vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(0.2, -1.0),
+                Vec2::new(-0.3, -2.0),
+                Vec2::new(0.4, -3.0),
+                Vec2::new(0.0, -4.0),
+            ],
+            (0..5).map(|node| Vec2::new(0.0, -node as f64)).collect(),
+        ] {
+            let mut state = State::new(positions);
+            state.velocities = vec![
+                Vec2::ZERO,
+                Vec2::new(3.0, -2.0),
+                Vec2::new(-1.0, 4.0),
+                Vec2::new(2.0, 1.0),
+                Vec2::ZERO,
+            ];
+            let masses = vec![1.0; state.node_count()];
+            let mut projection = VelocityProjection::new(state.node_count() - 1);
+
+            projection.project(&mut state, &masses, Vec2::ZERO);
+
+            for element in 0..state.node_count() - 1 {
+                let delta = state.positions[element + 1] - state.positions[element];
+                let axial_speed = (delta / delta.length())
+                    .dot(state.velocities[element + 1] - state.velocities[element]);
+                assert!(
+                    axial_speed.abs() < 1.0e-8,
+                    "element {element}: {axial_speed:e}"
+                );
+            }
+        }
     }
 }
