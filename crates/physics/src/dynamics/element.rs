@@ -35,14 +35,11 @@ pub(super) fn kinematics(
     })
 }
 
-pub(super) fn extension_rate(state: &State, left: usize) -> f64 {
-    let right = left + 1;
-    let delta = state.positions[right] - state.positions[left];
-    let length = delta.length();
-    if length <= f64::EPSILON {
-        0.0
+pub(super) fn extension_rate(state: &State, left: usize, rest_length: f64) -> f64 {
+    if let Some(k) = kinematics(state, left, rest_length) {
+        k.axial.extension_rate
     } else {
-        (delta / length).dot(state.velocities[right] - state.velocities[left])
+        0.0
     }
 }
 
@@ -81,28 +78,4 @@ pub(super) fn force_jacobians(
     }
 
     (position_jacobian, velocity_jacobian)
-}
-
-pub(super) fn scalar_jacobians(
-    kinematics: ElementKinematics,
-    extension_tangent: f64,
-    rate_tangent: f64,
-) -> ([f64; 2], [f64; 2]) {
-    let direction = kinematics.direction;
-    let inverse_length = 1.0 / kinematics.length;
-    let projected_velocity = Vec2::new(
-        ((1.0 - direction.x * direction.x) * kinematics.relative_velocity.x
-            - direction.x * direction.y * kinematics.relative_velocity.y)
-            * inverse_length,
-        (-direction.x * direction.y * kinematics.relative_velocity.x
-            + (1.0 - direction.y * direction.y) * kinematics.relative_velocity.y)
-            * inverse_length,
-    );
-    (
-        [
-            extension_tangent * direction.x + rate_tangent * projected_velocity.x,
-            extension_tangent * direction.y + rate_tangent * projected_velocity.y,
-        ],
-        [rate_tangent * direction.x, rate_tangent * direction.y],
-    )
 }

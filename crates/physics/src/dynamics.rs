@@ -2,18 +2,20 @@ pub(crate) mod bending;
 mod element;
 
 use crate::config::SimulationConfig;
-use crate::integrators::block_pentadiagonal::BlockPentadiagonalMatrix;
 use crate::integrators::{AccelerationJacobianBlock, DynamicalSystem};
 use crate::kinematics::{KinematicMotion, KinematicTarget};
-use crate::materials::{AxialKinematics, AxialMaterial, AxialResponse};
+use crate::materials::{
+    AxialKinematics, AxialMaterial, AxialResponse, StandardLinearSolidState,
+    StandardLinearSolidStateDerivative,
+};
 use crate::math::{Matrix2, Vec2};
 use crate::state::State;
 
-use element::{extension_rate, force_jacobians, kinematics, scalar_jacobians};
+use element::{extension_rate, force_jacobians, kinematics};
 
-const POSITION_OFFSET: usize = 0;
-const VELOCITY_OFFSET: usize = 2;
-const MATERIAL_COMPONENT: usize = 4;
+fn sls_state(state: &State, element: usize) -> Option<StandardLinearSolidState> {
+    state.sls_state.as_ref().map(|states| states[element])
+}
 
 pub(crate) struct RopeDynamics<'a> {
     config: &'a SimulationConfig,
@@ -159,7 +161,7 @@ impl<'a> RopeDynamics<'a> {
     fn acceleration_jacobian(&self, state: &State, output: &mut Vec<AccelerationJacobianBlock>) {
         self.assemble_acceleration_jacobian(state, output, |left, kinematics| {
             self.material
-                .response(kinematics, state.material_state[left], self.rest_length)
+                .response(kinematics, sls_state(state, left), self.rest_length)
         });
     }
 }
@@ -177,11 +179,9 @@ impl DynamicalSystem for RopeDynamics<'_> {
             let Some(kinematics) = kinematics(state, left, self.rest_length) else {
                 continue;
             };
-            let response = self.material.response(
-                kinematics.axial,
-                state.material_state[left],
-                self.rest_length,
-            );
+            let response =
+                self.material
+                    .response(kinematics.axial, sls_state(state, left), self.rest_length);
             let force = kinematics.direction * response.force;
             let right = left + 1;
 
@@ -214,222 +214,67 @@ impl DynamicalSystem for RopeDynamics<'_> {
         }
     }
 
-    fn material_state_derivatives(&self, state: &State, output: &mut [f64]) {
-        output.fill(0.0);
-        if !self.material.has_internal_state() {
+    fn sls_state_derivatives(
+        &self,
+        state: &State,
+        output: &mut Vec<StandardLinearSolidStateDerivative>,
+    ) {
+        let Some(states) = &state.sls_state else {
+            output.clear();
             return;
-        }
+        };
+        output.resize(states.len(), StandardLinearSolidStateDerivative::default());
 
-        for (left, derivative) in output
-            .iter_mut()
+        for left in 0..self.config.segment_count {
+            output[left] = self.material.sls_state_derivative(
+                extension_rate(state, left, self.rest_length),
+                states[left],
+                self.rest_length,
+            );
+        }
+    }
+
+    fn update_implicit_trial_state(&self, committed: &State, trial: &mut State, dt: f64) {
+        let Some(committed_states) = &committed.sls_state else {
+            return;
+        };
+
+        for (left, &committed_state) in committed_states
+            .iter()
             .enumerate()
             .take(self.config.segment_count)
         {
-            *derivative = self.material.state_derivative(
-                extension_rate(state, left),
-                state.material_state[left],
-                self.rest_length,
+            let kinematics = kinematics(trial, left, self.rest_length).map_or(
+                AxialKinematics {
+                    extension: -self.rest_length,
+                    extension_rate: 0.0,
+                },
+                |kinematics| kinematics.axial,
             );
-        }
-    }
-
-    fn first_order_jacobian(&self, state: &State, output: &mut BlockPentadiagonalMatrix) {
-        output.resize_and_clear(state.node_count());
-
-        for node in 0..state.node_count() {
-            if self.is_dynamic_node(node) {
-                output.add_value(node, node, 0, 2, 1.0);
-                output.add_value(node, node, 1, 3, 1.0);
-                output.add_value(node, node, 2, 2, -self.config.air_damping_rate);
-                output.add_value(node, node, 3, 3, -self.config.air_damping_rate);
-            }
-        }
-
-        let state_tangents = self.material.state_tangents(self.rest_length);
-        let force_state_tangent = self.material.force_state_tangent();
-        for left in 0..self.config.segment_count {
-            let right = left + 1;
-            output.add_value(
-                left,
-                left,
-                MATERIAL_COMPONENT,
-                MATERIAL_COMPONENT,
-                -self.material.relaxation_rate(),
-            );
-
-            let Some(kinematics) = kinematics(state, left, self.rest_length) else {
-                continue;
-            };
-            let response = self.material.response(
-                kinematics.axial,
-                state.material_state[left],
-                self.rest_length,
-            );
-            let (force_position_jacobian, force_velocity_jacobian) =
-                force_jacobians(kinematics, response);
-
-            if self.is_dynamic_node(left) {
-                add_force_jacobian_row(
-                    output,
-                    left,
-                    left,
-                    force_position_jacobian,
-                    force_velocity_jacobian,
-                    -1.0 / self.masses[left],
-                );
-                add_force_jacobian_row(
-                    output,
-                    left,
-                    right,
-                    force_position_jacobian,
-                    force_velocity_jacobian,
-                    1.0 / self.masses[left],
-                );
-                output.add_value(
-                    left,
-                    left,
-                    VELOCITY_OFFSET,
-                    MATERIAL_COMPONENT,
-                    kinematics.direction.x * force_state_tangent / self.masses[left],
-                );
-                output.add_value(
-                    left,
-                    left,
-                    VELOCITY_OFFSET + 1,
-                    MATERIAL_COMPONENT,
-                    kinematics.direction.y * force_state_tangent / self.masses[left],
-                );
-            }
-            if self.is_dynamic_node(right) {
-                add_force_jacobian_row(
-                    output,
-                    right,
-                    left,
-                    force_position_jacobian,
-                    force_velocity_jacobian,
-                    1.0 / self.masses[right],
-                );
-                add_force_jacobian_row(
-                    output,
-                    right,
-                    right,
-                    force_position_jacobian,
-                    force_velocity_jacobian,
-                    -1.0 / self.masses[right],
-                );
-                output.add_value(
-                    right,
-                    left,
-                    VELOCITY_OFFSET,
-                    MATERIAL_COMPONENT,
-                    -kinematics.direction.x * force_state_tangent / self.masses[right],
-                );
-                output.add_value(
-                    right,
-                    left,
-                    VELOCITY_OFFSET + 1,
-                    MATERIAL_COMPONENT,
-                    -kinematics.direction.y * force_state_tangent / self.masses[right],
-                );
-            }
-
-            let (state_position_jacobian, state_velocity_jacobian) = scalar_jacobians(
+            let material_trial = self.material.sls_backward_euler_trial(
                 kinematics,
-                state_tangents.extension,
-                state_tangents.extension_rate,
-            );
-            for component in 0..2 {
-                output.add_value(
-                    left,
-                    left,
-                    MATERIAL_COMPONENT,
-                    POSITION_OFFSET + component,
-                    -state_position_jacobian[component],
-                );
-                output.add_value(
-                    left,
-                    right,
-                    MATERIAL_COMPONENT,
-                    POSITION_OFFSET + component,
-                    state_position_jacobian[component],
-                );
-                output.add_value(
-                    left,
-                    left,
-                    MATERIAL_COMPONENT,
-                    VELOCITY_OFFSET + component,
-                    -state_velocity_jacobian[component],
-                );
-                output.add_value(
-                    left,
-                    right,
-                    MATERIAL_COMPONENT,
-                    VELOCITY_OFFSET + component,
-                    state_velocity_jacobian[component],
-                );
-            }
-        }
-
-        if self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0 {
-            for center in 1..state.node_count().saturating_sub(1) {
-                let Some(geometry) = bending::geometry(state, center) else {
-                    continue;
-                };
-                let response = bending::response(
-                    &geometry,
-                    self.rest_length,
-                    self.config.bending_rigidity,
-                    self.config.bending_viscosity,
-                );
-                let nodes = [center - 1, center, center + 1];
-                for (local_row, &row_node) in nodes.iter().enumerate() {
-                    if !self.is_dynamic_node(row_node) {
-                        continue;
-                    }
-                    for (local_column, &column_node) in nodes.iter().enumerate() {
-                        add_force_jacobian_row(
-                            output,
-                            row_node,
-                            column_node,
-                            response.position_jacobian[local_row][local_column],
-                            response.velocity_jacobian[local_row][local_column],
-                            1.0 / self.masses[row_node],
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn prepare_implicit_state(&self, initial: &State, trial: &mut State, dt: f64) {
-        if !self.material.has_internal_state() {
-            return;
-        }
-
-        for left in 0..self.config.segment_count {
-            trial.material_state[left] = self.material.backward_euler_state(
-                extension_rate(trial, left),
-                initial.material_state[left],
+                committed_state,
                 self.rest_length,
                 dt,
             );
+            trial
+                .sls_state
+                .as_mut()
+                .expect("SLS trial has per-element state")[left] = material_trial.state;
         }
     }
 
     fn implicit_acceleration_jacobian(
         &self,
-        _initial: &State,
+        committed: &State,
         state: &State,
         dt: f64,
         output: &mut Vec<AccelerationJacobianBlock>,
     ) {
         self.assemble_acceleration_jacobian(state, output, |left, kinematics| {
-            self.material.backward_euler_response(
-                kinematics,
-                state.material_state[left],
-                self.rest_length,
-                dt,
-            )
+            self.material
+                .backward_euler_trial(kinematics, sls_state(committed, left), self.rest_length, dt)
+                .response
         });
     }
 
@@ -507,10 +352,6 @@ impl DynamicalSystem for RopeDynamics<'_> {
         axial_limit.min(bending_limit)
     }
 
-    fn has_kinematic_target(&self) -> bool {
-        self.payload_target.is_some()
-    }
-
     fn kinematic_timestep_limit(&self) -> f64 {
         if self.payload_target.is_some() && self.kinematic_speed > 0.0 {
             self.material.maximum_kinematic_travel_fraction() * self.rest_length
@@ -535,34 +376,6 @@ fn push_element_jacobian_row(
         position: force_position_jacobian.map(|row| row.map(|value| scale * value)),
         velocity: force_velocity_jacobian.map(|row| row.map(|value| scale * value)),
     });
-}
-
-fn add_force_jacobian_row(
-    output: &mut BlockPentadiagonalMatrix,
-    row_node: usize,
-    column_node: usize,
-    force_position_jacobian: Matrix2,
-    force_velocity_jacobian: Matrix2,
-    scale: f64,
-) {
-    for row in 0..2 {
-        for column in 0..2 {
-            output.add_value(
-                row_node,
-                column_node,
-                VELOCITY_OFFSET + row,
-                POSITION_OFFSET + column,
-                scale * force_position_jacobian[row][column],
-            );
-            output.add_value(
-                row_node,
-                column_node,
-                VELOCITY_OFFSET + row,
-                VELOCITY_OFFSET + column,
-                scale * force_velocity_jacobian[row][column],
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -669,7 +482,7 @@ mod tests {
         let rest_length = config.rope_length / config.segment_count as f64;
         let masses = test_masses(config);
         let mut initial = test_state();
-        initial.material_state = vec![120.0, -35.0, 80.0];
+        set_sls_components(&mut initial, config, &[120.0, -35.0, 80.0]);
 
         let system = RopeDynamics::new(&config, &masses, rest_length, None, None, 0.0);
         let dt = 0.01;
@@ -688,7 +501,7 @@ mod tests {
             *position += *velocity * dt;
         }
         trial.velocities[1..node_count].copy_from_slice(&trial_velocities[1..node_count]);
-        system.prepare_implicit_state(&initial, &mut trial, dt);
+        system.update_implicit_trial_state(&initial, &mut trial, dt);
 
         let mut blocks = Vec::new();
         system.implicit_acceleration_jacobian(&initial, &trial, dt, &mut blocks);
@@ -721,8 +534,8 @@ mod tests {
                     column_component,
                     -step / dt,
                 );
-                system.prepare_implicit_state(&initial, &mut plus, dt);
-                system.prepare_implicit_state(&initial, &mut minus, dt);
+                system.update_implicit_trial_state(&initial, &mut plus, dt);
+                system.update_implicit_trial_state(&initial, &mut minus, dt);
 
                 let mut plus_acceleration = vec![Vec2::ZERO; trial.node_count()];
                 let mut minus_acceleration = vec![Vec2::ZERO; trial.node_count()];
@@ -734,68 +547,6 @@ mod tests {
                         (plus_acceleration[row_node] - minus_acceleration[row_node]) / (2.0 * step);
                     assert_component_close(analytic[row_node].x, finite_difference.x);
                     assert_component_close(analytic[row_node].y, finite_difference.y);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn first_order_sls_jacobian_matches_central_differences() {
-        let config = SimulationConfig {
-            segment_count: 3,
-            rope_model: RopeModelKind::StandardLinearSolid,
-            axial_viscosity: 900.0,
-            transient_axial_rigidity: 18_000.0,
-            bending_rigidity: 0.2,
-            bending_viscosity: 0.03,
-            ..SimulationConfig::default()
-        };
-        let rest_length = config.rope_length / config.segment_count as f64;
-        let masses = test_masses(config);
-        let mut state = test_state();
-        state.velocities = vec![
-            Vec2::ZERO,
-            Vec2::new(0.3, -0.2),
-            Vec2::new(-0.4, 0.1),
-            Vec2::new(0.2, 0.5),
-        ];
-        state.material_state = vec![120.0, -35.0, 80.0];
-
-        let system = RopeDynamics::new(&config, &masses, rest_length, None, None, 0.0);
-        let mut jacobian = BlockPentadiagonalMatrix::new(state.node_count());
-        system.first_order_jacobian(&state, &mut jacobian);
-
-        for column_node in 0..state.node_count() {
-            let component_count = if column_node < state.material_state.len() {
-                5
-            } else {
-                4
-            };
-            for column_component in 0..component_count {
-                let step = 1.0e-6;
-                let mut plus = state.clone();
-                let mut minus = state.clone();
-                add_state_component(&mut plus, column_node, column_component, step);
-                add_state_component(&mut minus, column_node, column_component, -step);
-                let plus_derivative = first_order_derivative(&system, &plus);
-                let minus_derivative = first_order_derivative(&system, &minus);
-
-                for row_node in 0..state.node_count() {
-                    for row_component in 0..5 {
-                        let finite_difference = (plus_derivative[row_node][row_component]
-                            - minus_derivative[row_node][row_component])
-                            / (2.0 * step);
-                        assert_component_close(
-                            block_value(
-                                &jacobian,
-                                row_node,
-                                column_node,
-                                row_component,
-                                column_component,
-                            ),
-                            finite_difference,
-                        );
-                    }
                 }
             }
         }
@@ -827,56 +578,11 @@ mod tests {
         }
     }
 
-    fn add_state_component(state: &mut State, node: usize, component: usize, amount: f64) {
-        match component {
-            0 | 1 => add_component(&mut state.positions[node], component, amount),
-            2 | 3 => add_component(&mut state.velocities[node], component - 2, amount),
-            4 => state.material_state[node] += amount,
-            _ => unreachable!(),
-        }
-    }
-
-    fn first_order_derivative(system: &RopeDynamics<'_>, state: &State) -> Vec<[f64; 5]> {
-        let mut accelerations = vec![Vec2::ZERO; state.node_count()];
-        let mut material_derivatives = vec![0.0; state.material_state.len()];
-        system.accelerations(state, &mut accelerations);
-        system.material_state_derivatives(state, &mut material_derivatives);
-        (0..state.node_count())
-            .map(|node| {
-                let mut derivative = [0.0; 5];
-                if system.is_dynamic_node(node) {
-                    derivative[0] = state.velocities[node].x;
-                    derivative[1] = state.velocities[node].y;
-                    derivative[2] = accelerations[node].x;
-                    derivative[3] = accelerations[node].y;
-                }
-                if node < material_derivatives.len() {
-                    derivative[4] = material_derivatives[node];
-                }
-                derivative
-            })
-            .collect()
-    }
-
-    fn block_value(
-        matrix: &BlockPentadiagonalMatrix,
-        row_block: usize,
-        column_block: usize,
-        row: usize,
-        column: usize,
-    ) -> f64 {
-        if row_block == column_block {
-            matrix.diagonal[row_block][row][column]
-        } else if row_block == column_block + 1 {
-            matrix.lower[column_block][row][column]
-        } else if column_block == row_block + 1 {
-            matrix.upper[row_block][row][column]
-        } else if row_block == column_block + 2 {
-            matrix.second_lower[column_block][row][column]
-        } else if column_block == row_block + 2 {
-            matrix.second_upper[row_block][row][column]
-        } else {
-            0.0
+    fn set_sls_components(state: &mut State, config: SimulationConfig, values: &[f64]) {
+        state.sls_state = AxialMaterial::from_config(config).initial_sls_state(values.len());
+        let states = state.sls_state.as_mut().expect("SLS has state");
+        for (state, value) in states.iter_mut().zip(values.iter().copied()) {
+            *state = StandardLinearSolidState::new(value);
         }
     }
 

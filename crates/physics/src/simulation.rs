@@ -94,10 +94,13 @@ impl Simulation {
             positions.push(config.anchor + Vec2::new(0.0, -(index as f64) * rest_length));
         }
         let scratch_positions = vec![Vec2::ZERO; node_count];
+        let material = AxialMaterial::from_config(config);
+        let mut state = State::new(positions);
+        state.sls_state = material.initial_sls_state(config.segment_count);
 
         let mut simulation = Self {
             config,
-            state: State::new(positions),
+            state,
             masses: vec![0.0; node_count],
             rest_length,
             time: 0.0,
@@ -174,7 +177,7 @@ impl Simulation {
                         extension: length - self.rest_length,
                         extension_rate: direction.dot(relative_velocity),
                     },
-                    self.state.material_state[left],
+                    self.state.sls_state.as_ref().map(|states| states[left]),
                     self.rest_length,
                 )
                 .force,
@@ -235,7 +238,8 @@ impl Simulation {
             self.config = config;
             self.rebuild_masses();
             if material_model_changed {
-                self.state.material_state.fill(0.0);
+                self.state.sls_state = AxialMaterial::from_config(self.config)
+                    .initial_sls_state(self.config.segment_count);
             }
             if integrator_changed {
                 self.integrator =
@@ -497,7 +501,7 @@ impl Simulation {
             maximum_segment_length = maximum_segment_length.max(length);
             elastic_energy += material.stored_energy(
                 extension,
-                self.state.material_state[index],
+                self.state.sls_state.as_ref().map(|states| states[index]),
                 self.rest_length,
             );
             maximum_absolute_strain =

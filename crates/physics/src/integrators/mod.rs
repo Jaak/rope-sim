@@ -1,22 +1,18 @@
 mod backward_euler;
-pub(crate) mod block_pentadiagonal;
 mod newton_block_pentadiagonal;
 mod rk4;
-mod rosenbrock;
 mod semi_implicit_euler;
 mod tr_bdf2;
 
 use std::error::Error;
 use std::fmt;
 
+use crate::materials::StandardLinearSolidStateDerivative;
 use crate::math::{Matrix2, Vec2};
 use crate::state::State;
 
-use block_pentadiagonal::BlockPentadiagonalMatrix;
-
 pub(crate) use backward_euler::{BackwardEuler, PredictorCorrection};
 use rk4::RungeKutta4;
-use rosenbrock::Rosenbrock2;
 use semi_implicit_euler::SemiImplicitEuler;
 use tr_bdf2::TrBdf2;
 
@@ -36,14 +32,16 @@ pub(crate) trait DynamicalSystem {
 
     /// Evaluate derivatives of per-element constitutive state for explicit
     /// integrators.
-    fn material_state_derivatives(&self, state: &State, output: &mut [f64]);
+    fn sls_state_derivatives(
+        &self,
+        state: &State,
+        output: &mut Vec<StandardLinearSolidStateDerivative>,
+    );
 
-    /// Assemble the Jacobian of the complete first-order state derivative in
-    /// node/element blocks for linearly implicit integration.
-    fn first_order_jacobian(&self, state: &State, output: &mut BlockPentadiagonalMatrix);
-
-    /// Update constitutive state consistently with a backward-Euler trial.
-    fn prepare_implicit_state(&self, initial: &State, trial: &mut State, dt: f64);
+    /// Derive constitutive state for a backward-Euler trial from the last
+    /// committed stage. This may be called repeatedly during Newton and must
+    /// not mutate `committed`; `trial` is committed only when the stage succeeds.
+    fn update_implicit_trial_state(&self, committed: &State, trial: &mut State, dt: f64);
 
     /// Acceleration Jacobian after eliminating implicit constitutive state.
     fn implicit_acceleration_jacobian(
@@ -67,9 +65,6 @@ pub(crate) trait DynamicalSystem {
     /// Conservative elastic timescale, excluding viscous and constitutive
     /// relaxation restrictions that a linearly implicit method handles directly.
     fn elastic_stable_timestep(&self, state: &State) -> f64;
-
-    /// Whether an endpoint is currently following a prescribed trajectory.
-    fn has_kinematic_target(&self) -> bool;
 
     /// Maximum step over which prescribed endpoint travel remains local to an
     /// element. Returns infinity when no endpoint is moving kinematically.
@@ -117,17 +112,15 @@ pub(crate) struct IntegratorStatistics {
 pub enum IntegratorKind {
     SemiImplicitEuler,
     RungeKutta4,
-    Rosenbrock2,
     TrBdf2,
     #[default]
     BackwardEuler,
 }
 
 impl IntegratorKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::SemiImplicitEuler,
         Self::RungeKutta4,
-        Self::Rosenbrock2,
         Self::TrBdf2,
         Self::BackwardEuler,
     ];
@@ -136,7 +129,6 @@ impl IntegratorKind {
         match self {
             Self::SemiImplicitEuler => "Semi-implicit Euler",
             Self::RungeKutta4 => "Runge-Kutta 4",
-            Self::Rosenbrock2 => "Rosenbrock ROS2 (experimental)",
             Self::TrBdf2 => "TR-BDF2",
             Self::BackwardEuler => "Backward Euler",
         }
@@ -150,7 +142,6 @@ pub(crate) fn create_integrator(
     match kind {
         IntegratorKind::SemiImplicitEuler => Box::new(SemiImplicitEuler::new(node_count)),
         IntegratorKind::RungeKutta4 => Box::new(RungeKutta4::new(node_count)),
-        IntegratorKind::Rosenbrock2 => Box::new(Rosenbrock2::new(node_count)),
         IntegratorKind::TrBdf2 => Box::new(TrBdf2::new(node_count)),
         IntegratorKind::BackwardEuler => Box::new(BackwardEuler::new(node_count)),
     }

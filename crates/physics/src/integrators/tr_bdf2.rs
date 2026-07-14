@@ -3,6 +3,7 @@ use faer::prelude::Solve;
 use faer::sparse::linalg::solvers::{Lu, SymbolicLu};
 use faer::sparse::{SparseColMat, Triplet};
 
+use crate::materials::{StandardLinearSolidState, StandardLinearSolidStateDerivative};
 use crate::math::Vec2;
 use crate::state::State;
 
@@ -30,7 +31,7 @@ pub(super) struct TrBdf2 {
     position_reference: Vec<Vec2>,
     predictor: Vec<Vec2>,
     accelerations: Vec<Vec2>,
-    material_derivatives: Vec<f64>,
+    sls_derivatives: Vec<StandardLinearSolidStateDerivative>,
     solver: StageSolver,
     statistics: IntegratorStatistics,
 }
@@ -46,7 +47,7 @@ impl TrBdf2 {
             position_reference: vec![Vec2::ZERO; node_count],
             predictor: vec![Vec2::ZERO; node_count],
             accelerations: vec![Vec2::ZERO; node_count],
-            material_derivatives: vec![0.0; node_count.saturating_sub(1)],
+            sls_derivatives: Vec::with_capacity(node_count.saturating_sub(1)),
             solver: StageSolver::new(node_count),
             statistics: IntegratorStatistics::default(),
         }
@@ -66,10 +67,7 @@ impl TrBdf2 {
         self.accelerations.resize(state.node_count(), Vec2::ZERO);
         self.accelerations.fill(Vec2::ZERO);
         system.accelerations(&self.initial, &mut self.accelerations);
-        self.material_derivatives
-            .resize(state.node_count().saturating_sub(1), 0.0);
-        self.material_derivatives.fill(0.0);
-        system.material_state_derivatives(&self.initial, &mut self.material_derivatives);
+        system.sls_state_derivatives(&self.initial, &mut self.sls_derivatives);
 
         self.position_reference
             .resize(state.node_count(), Vec2::ZERO);
@@ -82,13 +80,10 @@ impl TrBdf2 {
                 + self.initial.velocities[node] * (2.0 * stage_dt)
                 + self.accelerations[node] * (stage_dt * stage_dt);
         }
-        for (base, derivative) in self
-            .material_base
-            .material_state
-            .iter_mut()
-            .zip(&self.material_derivatives)
-        {
-            *base += stage_dt * derivative;
+        if let Some(states) = &mut self.material_base.sls_state {
+            for (state, derivative) in states.iter_mut().zip(&self.sls_derivatives) {
+                state.add_scaled(*derivative, stage_dt);
+            }
         }
 
         self.trapezoidal.clone_from(&self.initial);
@@ -111,10 +106,17 @@ impl TrBdf2 {
                 + self.trapezoidal.velocities[node] * BDF_STAGE_WEIGHT;
             self.predictor[node] = self.position_reference[node] + base_velocity * stage_dt;
         }
-        for element in 0..self.material_base.material_state.len() {
-            self.material_base.material_state[element] = self.initial.material_state[element]
-                * INITIAL_STAGE_WEIGHT
-                + self.trapezoidal.material_state[element] * BDF_STAGE_WEIGHT;
+        if let (Some(output), Some(initial), Some(trapezoidal)) = (
+            &mut self.material_base.sls_state,
+            &self.initial.sls_state,
+            &self.trapezoidal.sls_state,
+        ) {
+            for element in 0..output.len() {
+                output[element] = StandardLinearSolidState::new(
+                    initial[element].transient_force() * INITIAL_STAGE_WEIGHT
+                        + trapezoidal[element].transient_force() * BDF_STAGE_WEIGHT,
+                );
+            }
         }
 
         state.clone_from(&self.trapezoidal);
@@ -266,7 +268,7 @@ impl StageSolver {
         self.base_unknowns.resize(dimension, 0.0);
 
         if dimension == 0 {
-            system.prepare_implicit_state(material_base, &mut self.trial, dt);
+            system.update_implicit_trial_state(material_base, &mut self.trial, dt);
             output.clone_from(&self.trial);
             return Ok(());
         }
@@ -400,7 +402,7 @@ fn evaluate_residual(
         trial.velocities[node] = (trial.positions[node] - position_reference[node]) / dt;
     }
     system.enforce_kinematics(trial, stage_time);
-    system.prepare_implicit_state(material_base, trial, dt);
+    system.update_implicit_trial_state(material_base, trial, dt);
     accelerations.fill(Vec2::ZERO);
     system.accelerations(trial, accelerations);
     let dt_squared = dt * dt;

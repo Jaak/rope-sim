@@ -1,3 +1,4 @@
+use crate::materials::StandardLinearSolidStateDerivative;
 use crate::math::Vec2;
 use crate::state::State;
 
@@ -63,12 +64,13 @@ impl TimeIntegrator for RungeKutta4 {
                 + self.k4.velocities[node])
                 * scale;
         }
-        for element in 0..state.material_state.len() {
-            state.material_state[element] += (self.k1.material_state[element]
-                + 2.0 * self.k2.material_state[element]
-                + 2.0 * self.k3.material_state[element]
-                + self.k4.material_state[element])
-                * scale;
+        if let Some(states) = &mut state.sls_state {
+            for (element, state) in states.iter_mut().enumerate() {
+                state.add_scaled(self.k1.sls_state[element], scale);
+                state.add_scaled(self.k2.sls_state[element], 2.0 * scale);
+                state.add_scaled(self.k3.sls_state[element], 2.0 * scale);
+                state.add_scaled(self.k4.sls_state[element], scale);
+            }
         }
 
         system.enforce_kinematics(state, dt);
@@ -97,7 +99,7 @@ impl TimeIntegrator for RungeKutta4 {
 struct StateDerivative {
     positions: Vec<Vec2>,
     velocities: Vec<Vec2>,
-    material_state: Vec<f64>,
+    sls_state: Vec<StandardLinearSolidStateDerivative>,
 }
 
 impl StateDerivative {
@@ -105,25 +107,22 @@ impl StateDerivative {
         Self {
             positions: vec![Vec2::ZERO; node_count],
             velocities: vec![Vec2::ZERO; node_count],
-            material_state: vec![0.0; node_count.saturating_sub(1)],
+            sls_state: Vec::with_capacity(node_count.saturating_sub(1)),
         }
     }
 
     fn resize_and_clear(&mut self, node_count: usize) {
         self.positions.resize(node_count, Vec2::ZERO);
         self.velocities.resize(node_count, Vec2::ZERO);
-        self.material_state
-            .resize(node_count.saturating_sub(1), 0.0);
         self.positions.fill(Vec2::ZERO);
         self.velocities.fill(Vec2::ZERO);
-        self.material_state.fill(0.0);
     }
 }
 
 fn evaluate_derivative(system: &dyn DynamicalSystem, state: &State, output: &mut StateDerivative) {
     output.resize_and_clear(state.node_count());
     system.accelerations(state, &mut output.velocities);
-    system.material_state_derivatives(state, &mut output.material_state);
+    system.sls_state_derivatives(state, &mut output.sls_state);
     for node in 0..state.node_count() {
         if system.is_dynamic_node(node) {
             output.positions[node] = state.velocities[node];
@@ -146,8 +145,10 @@ fn set_stage(
             stage.velocities[node] += derivative.velocities[node] * dt;
         }
     }
-    for element in 0..initial.material_state.len() {
-        stage.material_state[element] += derivative.material_state[element] * dt;
+    if let Some(states) = &mut stage.sls_state {
+        for (state, derivative) in states.iter_mut().zip(&derivative.sls_state) {
+            state.add_scaled(*derivative, dt);
+        }
     }
     system.enforce_kinematics(stage, stage_time);
 }

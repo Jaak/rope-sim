@@ -277,7 +277,7 @@ impl BackwardEuler {
         let end_time = start_time + dt;
 
         if self.dynamic_nodes.is_empty() {
-            system.prepare_implicit_state(&self.initial, &mut self.trial, dt);
+            system.update_implicit_trial_state(&self.initial, &mut self.trial, dt);
             self.finish(system, state, end_time)?;
             return Ok(PredictorCorrection::Converged);
         }
@@ -485,7 +485,7 @@ fn evaluate_residual(
         trial.velocities[node] = (trial.positions[node] - initial.positions[node]) / dt;
     }
     system.enforce_kinematics(trial, end_time);
-    system.prepare_implicit_state(initial, trial, dt);
+    system.update_implicit_trial_state(initial, trial, dt);
     accelerations.fill(Vec2::ZERO);
     system.accelerations(trial, accelerations);
 

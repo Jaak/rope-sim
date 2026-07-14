@@ -1,3 +1,4 @@
+use crate::materials::StandardLinearSolidStateDerivative;
 use crate::math::Vec2;
 use crate::state::State;
 
@@ -5,14 +6,14 @@ use super::{DynamicalSystem, StepError, TimeIntegrator, validate_timestep};
 
 pub(super) struct SemiImplicitEuler {
     accelerations: Vec<Vec2>,
-    material_derivatives: Vec<f64>,
+    sls_derivatives: Vec<StandardLinearSolidStateDerivative>,
 }
 
 impl SemiImplicitEuler {
     pub fn new(node_count: usize) -> Self {
         Self {
             accelerations: vec![Vec2::ZERO; node_count],
-            material_derivatives: vec![0.0; node_count.saturating_sub(1)],
+            sls_derivatives: Vec::with_capacity(node_count.saturating_sub(1)),
         }
     }
 }
@@ -30,16 +31,11 @@ impl TimeIntegrator for SemiImplicitEuler {
         self.accelerations.resize(state.node_count(), Vec2::ZERO);
         self.accelerations.fill(Vec2::ZERO);
         system.accelerations(state, &mut self.accelerations);
-        self.material_derivatives
-            .resize(state.material_state.len(), 0.0);
-        system.material_state_derivatives(state, &mut self.material_derivatives);
-
-        for (value, derivative) in state
-            .material_state
-            .iter_mut()
-            .zip(&self.material_derivatives)
-        {
-            *value += derivative * dt;
+        system.sls_state_derivatives(state, &mut self.sls_derivatives);
+        if let Some(states) = &mut state.sls_state {
+            for (state, derivative) in states.iter_mut().zip(&self.sls_derivatives) {
+                state.add_scaled(*derivative, dt);
+            }
         }
 
         for index in 0..state.node_count() {

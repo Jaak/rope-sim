@@ -274,12 +274,18 @@ fn advance_material_state(config: &SimulationConfig, state: &mut State, rest_len
         } else {
             0.0
         };
-        state.material_state[element] = material.backward_euler_state(
-            extension_rate,
-            state.material_state[element],
+        let trial = material.backward_euler_trial(
+            crate::materials::AxialKinematics {
+                extension: length - rest_length,
+                extension_rate,
+            },
+            state.sls_state.as_ref().map(|states| states[element]),
             rest_length,
             dt,
         );
+        if let (Some(states), Some(next_state)) = (&mut state.sls_state, trial.sls_state) {
+            states[element] = next_state;
+        }
     }
 }
 

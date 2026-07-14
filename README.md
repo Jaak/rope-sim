@@ -56,9 +56,9 @@ quadratic Kelvin-Voigt, and standard linear solid rope models,
 mass-proportional air damping, optional experimental bending elasticity and
 viscosity, and hybrid XPBD/backward-Euler manipulation of the payload. The UI
 offers semi-implicit Euler, classical fourth-order Runge-Kutta (RK4),
-second-order L-stable Rosenbrock ROS2, TR-BDF2, and fully converged backward
-Euler integration. Implicit bending uses a linear-time block-pentadiagonal
-solve, with sparse LU retained as a safety fallback.
+TR-BDF2, and fully converged backward Euler integration. Implicit bending uses
+a linear-time block-pentadiagonal solve, with sparse LU retained as a safety
+fallback.
 
 The default scene represents a 12 m Petzl VOLTA GUIDE 9 mm reference rope
 weighing 0.648 kg (54 g/m), with an 80 kg payload. Its standard-linear-solid
@@ -66,3 +66,25 @@ preset is calibrated to the published 7.6% static elongation, 34% dynamic
 elongation, and 8.5 kN impact force. Every rope model loads its own recommended
 parameters when selected; Hooke and quadratic Kelvin-Voigt intentionally favor
 lively illustrative behavior over material accuracy.
+
+## Research TODO
+
+- Investigate a **nonlinear activated standard-linear-solid model** for dynamic
+  climbing rope. Keep the current SLS relaxation state, replace its linear
+  elastic response with a tension-only law that stiffens at large strain, and
+  add one bounded, reversible internal state that makes dissipation weak
+  initially and stronger near peak load, then recovers after unloading. Do not
+  introduce plastic strain, evolving rest length, or damage. This is intended
+  to capture the three material effects highlighted by
+  [Leuthausser's climbing-rope study](https://journals.sagepub.com/doi/abs/10.1177/1754337116651184):
+  stress relaxation, large-strain stiffening, and delayed friction. Distributed
+  rope mass is already represented by the node discretization.
+- Calibrate that model against full force-time traces at several fall factors
+  and payloads, checking peak force and its timing, post-peak relaxation,
+  rebound, and higher-mode oscillations. Use TR-BDF2 plus timestep refinement
+  for calibration so that backward Euler's numerical damping does not mask
+  material behavior.
+- Consider a generalized Maxwell/Prony relaxation spectrum only if the traces
+  show that one transient branch is insufficient. A linear generalized Maxwell
+  model can represent several relaxation times, but does not by itself provide
+  large-strain stiffening or load-dependent delayed friction.

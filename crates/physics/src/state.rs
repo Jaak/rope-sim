@@ -1,12 +1,13 @@
+use crate::materials::StandardLinearSolidState;
 use crate::math::Vec2;
 
 #[derive(Clone)]
 pub(crate) struct State {
     pub positions: Vec<Vec2>,
     pub velocities: Vec<Vec2>,
-    /// Per-element constitutive state. Currently this stores the Maxwell-branch
-    /// axial force for the standard linear solid model.
-    pub material_state: Vec<f64>,
+    /// One transient-force state per element for SLS, absent for stateless
+    /// constitutive models.
+    pub sls_state: Option<Vec<StandardLinearSolidState>>,
 }
 
 impl State {
@@ -15,7 +16,7 @@ impl State {
         Self {
             positions,
             velocities: vec![Vec2::ZERO; node_count],
-            material_state: vec![0.0; node_count.saturating_sub(1)],
+            sls_state: None,
         }
     }
 
@@ -24,10 +25,26 @@ impl State {
     }
 
     pub fn is_finite(&self) -> bool {
-        self.positions
-            .iter()
-            .chain(&self.velocities)
-            .all(|value| value.is_finite())
-            && self.material_state.iter().all(|value| value.is_finite())
+        if let Some(states) = &self.sls_state {
+            for state in states {
+                if !state.is_finite() {
+                    return false;
+                }
+            }
+        }
+
+        for position in &self.positions {
+            if !position.is_finite() {
+                return false;
+            }
+        }
+
+        for velocity in &self.velocities {
+            if !velocity.is_finite() {
+                return false;
+            }
+        }
+
+        true
     }
 }

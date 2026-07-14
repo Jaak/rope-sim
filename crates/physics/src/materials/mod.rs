@@ -9,6 +9,10 @@ use hooke::Hooke;
 use kelvin_voigt::KelvinVoigt;
 use quadratic_kelvin_voigt::QuadraticKelvinVoigt;
 use standard_linear_solid::StandardLinearSolid;
+pub(crate) use standard_linear_solid::{
+    StandardLinearSolidBackwardEulerTrial, StandardLinearSolidState,
+    StandardLinearSolidStateDerivative,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AxialKinematics {
@@ -23,10 +27,13 @@ pub(crate) struct AxialResponse {
     pub rate_tangent: f64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct MaterialStateTangents {
-    pub extension: f64,
-    pub extension_rate: f64,
+/// Result of eliminating an element's internal state for one backward-Euler
+/// trial. The caller may inspect this freely; the returned state is committed
+/// only if the enclosing integration stage succeeds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BackwardEulerMaterialTrial {
+    pub sls_state: Option<StandardLinearSolidState>,
+    pub response: AxialResponse,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,101 +72,99 @@ impl AxialMaterial {
     pub fn response(
         self,
         kinematics: AxialKinematics,
-        material_state: f64,
+        sls_state: Option<StandardLinearSolidState>,
         rest_length: f64,
     ) -> AxialResponse {
         match self {
             Self::Hooke(material) => material.response(kinematics, rest_length),
             Self::KelvinVoigt(material) => material.response(kinematics, rest_length),
             Self::QuadraticKelvinVoigt(material) => material.response(kinematics, rest_length),
-            Self::StandardLinearSolid(material) => {
-                material.response(kinematics, material_state, rest_length)
-            }
+            Self::StandardLinearSolid(material) => material.response(
+                kinematics,
+                sls_state.expect("SLS requires per-element state"),
+                rest_length,
+            ),
         }
     }
 
-    pub fn backward_euler_response(
+    pub fn initial_sls_state(self, element_count: usize) -> Option<Vec<StandardLinearSolidState>> {
+        match self {
+            Self::StandardLinearSolid(_) => {
+                Some(vec![StandardLinearSolidState::default(); element_count])
+            }
+            Self::Hooke(_) | Self::KelvinVoigt(_) | Self::QuadraticKelvinVoigt(_) => None,
+        }
+    }
+
+    pub fn backward_euler_trial(
         self,
         kinematics: AxialKinematics,
-        material_state: f64,
+        committed_state: Option<StandardLinearSolidState>,
         rest_length: f64,
         dt: f64,
-    ) -> AxialResponse {
+    ) -> BackwardEulerMaterialTrial {
         match self {
             Self::StandardLinearSolid(material) => {
-                material.backward_euler_response(kinematics, material_state, rest_length, dt)
+                let trial = material.backward_euler_trial(
+                    kinematics,
+                    committed_state.expect("SLS requires committed per-element state"),
+                    rest_length,
+                    dt,
+                );
+                BackwardEulerMaterialTrial {
+                    sls_state: Some(trial.state),
+                    response: trial.response,
+                }
             }
             Self::Hooke(_) | Self::KelvinVoigt(_) | Self::QuadraticKelvinVoigt(_) => {
-                self.response(kinematics, material_state, rest_length)
+                BackwardEulerMaterialTrial {
+                    sls_state: None,
+                    response: self.response(kinematics, None, rest_length),
+                }
             }
         }
     }
 
-    pub fn has_internal_state(self) -> bool {
-        matches!(self, Self::StandardLinearSolid(_))
-    }
-
-    pub fn state_derivative(
+    pub fn sls_backward_euler_trial(
         self,
-        extension_rate: f64,
-        material_state: f64,
-        rest_length: f64,
-    ) -> f64 {
-        match self {
-            Self::StandardLinearSolid(material) => {
-                material.state_derivative(extension_rate, material_state, rest_length)
-            }
-            Self::Hooke(_) | Self::KelvinVoigt(_) | Self::QuadraticKelvinVoigt(_) => 0.0,
-        }
-    }
-
-    pub fn force_state_tangent(self) -> f64 {
-        match self {
-            Self::StandardLinearSolid(_) => 1.0,
-            Self::Hooke(_) | Self::KelvinVoigt(_) | Self::QuadraticKelvinVoigt(_) => 0.0,
-        }
-    }
-
-    pub fn state_tangents(self, rest_length: f64) -> MaterialStateTangents {
-        match self {
-            Self::StandardLinearSolid(material) => MaterialStateTangents {
-                extension: 0.0,
-                extension_rate: material.transient_rigidity() / rest_length,
-            },
-            Self::Hooke(_) | Self::KelvinVoigt(_) | Self::QuadraticKelvinVoigt(_) => {
-                MaterialStateTangents::default()
-            }
-        }
-    }
-
-    pub fn backward_euler_state(
-        self,
-        extension_rate: f64,
-        initial_material_state: f64,
+        kinematics: AxialKinematics,
+        committed_state: StandardLinearSolidState,
         rest_length: f64,
         dt: f64,
-    ) -> f64 {
-        match self {
-            Self::StandardLinearSolid(material) => material.backward_euler_state(
-                extension_rate,
-                initial_material_state,
-                rest_length,
-                dt,
-            ),
-            Self::Hooke(_) | Self::KelvinVoigt(_) | Self::QuadraticKelvinVoigt(_) => {
-                initial_material_state
-            }
-        }
+    ) -> StandardLinearSolidBackwardEulerTrial {
+        let Self::StandardLinearSolid(material) = self else {
+            panic!("SLS backward-Euler trial requires the standard-linear-solid material");
+        };
+        material.backward_euler_trial(kinematics, committed_state, rest_length, dt)
     }
 
-    pub fn stored_energy(self, extension: f64, material_state: f64, rest_length: f64) -> f64 {
+    pub fn sls_state_derivative(
+        self,
+        extension_rate: f64,
+        sls_state: StandardLinearSolidState,
+        rest_length: f64,
+    ) -> StandardLinearSolidStateDerivative {
+        let Self::StandardLinearSolid(material) = self else {
+            panic!("SLS state derivative requires the standard-linear-solid material");
+        };
+        material.state_derivative(extension_rate, sls_state, rest_length)
+    }
+
+    pub fn stored_energy(
+        self,
+        extension: f64,
+        sls_state: Option<StandardLinearSolidState>,
+        rest_length: f64,
+    ) -> f64 {
         match self {
             Self::Hooke(material) => material.stored_energy(extension, rest_length),
             Self::KelvinVoigt(material) => material.stored_energy(extension, rest_length),
             Self::QuadraticKelvinVoigt(material) => material.stored_energy(extension, rest_length),
-            Self::StandardLinearSolid(material) => {
-                material.stored_energy(extension, material_state, rest_length)
-            }
+            Self::StandardLinearSolid(material) => material.stored_energy(
+                extension,
+                sls_state.expect("SLS requires per-element state"),
+                rest_length,
+            ),
         }
     }
 
@@ -211,10 +216,32 @@ mod tests {
         extension_rate: 0.4,
     };
 
+    fn response(
+        material: AxialMaterial,
+        kinematics: AxialKinematics,
+        rest_length: f64,
+    ) -> AxialResponse {
+        let state = material.initial_sls_state(1);
+        material.response(
+            kinematics,
+            state.as_ref().map(|states| states[0]),
+            rest_length,
+        )
+    }
+
+    fn stored_energy(material: AxialMaterial, extension: f64, rest_length: f64) -> f64 {
+        let state = material.initial_sls_state(1);
+        material.stored_energy(
+            extension,
+            state.as_ref().map(|states| states[0]),
+            rest_length,
+        )
+    }
+
     #[test]
     fn hooke_response_exposes_force_and_tangent() {
         let material = AxialMaterial::Hooke(Hooke::new(30_000.0));
-        let response = material.response(KINEMATICS, 0.0, REST_LENGTH);
+        let response = response(material, KINEMATICS, REST_LENGTH);
 
         assert_eq!(response.force, 3_000.0);
         assert_eq!(response.length_tangent, 15_000.0);
@@ -224,7 +251,7 @@ mod tests {
     #[test]
     fn kelvin_voigt_response_includes_viscous_force_and_tangent() {
         let material = AxialMaterial::KelvinVoigt(KelvinVoigt::new(30_000.0, 1_000.0));
-        let response = material.response(KINEMATICS, 0.0, REST_LENGTH);
+        let response = response(material, KINEMATICS, REST_LENGTH);
 
         assert_eq!(response.force, 3_200.0);
         assert_eq!(response.length_tangent, 15_000.0);
@@ -236,7 +263,7 @@ mod tests {
         let material = AxialMaterial::QuadraticKelvinVoigt(QuadraticKelvinVoigt::new(
             30_000.0, 100_000.0, 1_000.0,
         ));
-        let response = material.response(KINEMATICS, 0.0, REST_LENGTH);
+        let response = response(material, KINEMATICS, REST_LENGTH);
         let elastic_force: f64 = 4_000.0;
         let damping_scale: f64 = 3.0;
         let damping_activation = elastic_force / (elastic_force + damping_scale);
@@ -267,20 +294,20 @@ mod tests {
         let material = AxialMaterial::QuadraticKelvinVoigt(QuadraticKelvinVoigt::new(
             30_000.0, 100_000.0, 1_000.0,
         ));
-        let slack = material.response(
+        let slack = response(
+            material,
             AxialKinematics {
                 extension: -0.1,
                 extension_rate: 100.0,
             },
-            0.0,
             REST_LENGTH,
         );
-        let rapidly_shortening = material.response(
+        let rapidly_shortening = response(
+            material,
             AxialKinematics {
                 extension: 0.1,
                 extension_rate: -100.0,
             },
-            0.0,
             REST_LENGTH,
         );
 
@@ -296,11 +323,11 @@ mod tests {
         let material = AxialMaterial::QuadraticKelvinVoigt(QuadraticKelvinVoigt::new(
             30_000.0, 100_000.0, 1_000.0,
         ));
-        let coarse = material.stored_energy(0.2, 0.0, 2.0);
-        let refined = 2.0 * material.stored_energy(0.1, 0.0, 1.0);
+        let coarse = stored_energy(material, 0.2, 2.0);
+        let refined = 2.0 * stored_energy(material, 0.1, 1.0);
 
         assert!((coarse - refined).abs() < 1.0e-12);
-        assert_eq!(material.stored_energy(-0.1, 0.0, 1.0), 0.0);
+        assert_eq!(stored_energy(material, -0.1, 1.0), 0.0);
     }
 
     #[test]
@@ -312,54 +339,50 @@ mod tests {
             extension: 0.002,
             extension_rate: -0.04,
         };
-        let response = material.response(kinematics, 0.0, REST_LENGTH);
+        let evaluated = response(material, kinematics, REST_LENGTH);
         let step = 1.0e-8;
 
-        let position_difference = (material
-            .response(
+        let position_difference = (response(
+            material,
+            AxialKinematics {
+                extension: kinematics.extension + step,
+                ..kinematics
+            },
+            REST_LENGTH,
+        )
+        .force
+            - response(
+                material,
                 AxialKinematics {
-                    extension: kinematics.extension + step,
+                    extension: kinematics.extension - step,
                     ..kinematics
                 },
-                0.0,
                 REST_LENGTH,
             )
-            .force
-            - material
-                .response(
-                    AxialKinematics {
-                        extension: kinematics.extension - step,
-                        ..kinematics
-                    },
-                    0.0,
-                    REST_LENGTH,
-                )
-                .force)
+            .force)
             / (2.0 * step);
-        let rate_difference = (material
-            .response(
+        let rate_difference = (response(
+            material,
+            AxialKinematics {
+                extension_rate: kinematics.extension_rate + step,
+                ..kinematics
+            },
+            REST_LENGTH,
+        )
+        .force
+            - response(
+                material,
                 AxialKinematics {
-                    extension_rate: kinematics.extension_rate + step,
+                    extension_rate: kinematics.extension_rate - step,
                     ..kinematics
                 },
-                0.0,
                 REST_LENGTH,
             )
-            .force
-            - material
-                .response(
-                    AxialKinematics {
-                        extension_rate: kinematics.extension_rate - step,
-                        ..kinematics
-                    },
-                    0.0,
-                    REST_LENGTH,
-                )
-                .force)
+            .force)
             / (2.0 * step);
 
-        assert!((response.length_tangent - position_difference).abs() < 1.0e-3);
-        assert!((response.rate_tangent - rate_difference).abs() < 1.0e-5);
+        assert!((evaluated.length_tangent - position_difference).abs() < 1.0e-3);
+        assert!((evaluated.rate_tangent - rate_difference).abs() < 1.0e-5);
     }
 
     #[test]
@@ -369,36 +392,45 @@ mod tests {
         ));
         let extension = 0.002;
         let step = 1.0e-8;
-        let energy_difference = (material.stored_energy(extension + step, 0.0, REST_LENGTH)
-            - material.stored_energy(extension - step, 0.0, REST_LENGTH))
+        let energy_difference = (stored_energy(material, extension + step, REST_LENGTH)
+            - stored_energy(material, extension - step, REST_LENGTH))
             / (2.0 * step);
-        let force = material
-            .response(
-                AxialKinematics {
-                    extension,
-                    extension_rate: 0.0,
-                },
-                0.0,
-                REST_LENGTH,
-            )
-            .force;
+        let force = response(
+            material,
+            AxialKinematics {
+                extension,
+                extension_rate: 0.0,
+            },
+            REST_LENGTH,
+        )
+        .force;
 
         assert!((force - energy_difference).abs() < 1.0e-5);
     }
 
     #[test]
-    fn sls_backward_euler_response_uses_eliminated_internal_state() {
+    fn sls_backward_euler_trial_returns_state_and_eliminated_response() {
         let material = AxialMaterial::StandardLinearSolid(StandardLinearSolid::new(
             30_000.0, 15_000.0, 1_000.0,
         ));
         let dt = 0.01;
-        let state = material.backward_euler_state(0.4, 100.0, REST_LENGTH, dt);
-        let response = material.backward_euler_response(KINEMATICS, state, REST_LENGTH, dt);
+        let committed = StandardLinearSolidState::new(100.0);
+        let trial = material.backward_euler_trial(KINEMATICS, Some(committed), REST_LENGTH, dt);
 
         let denominator = 1.0 + dt * 15_000.0 / 1_000.0;
         let expected_state = (100.0 + dt * 15_000.0 * 0.4 / REST_LENGTH) / denominator;
-        assert!((state - expected_state).abs() < 1.0e-12);
-        assert!((response.force - (3_000.0 + expected_state)).abs() < 1.0e-12);
-        assert!((response.rate_tangent - 75.0 / denominator).abs() < 1.0e-12);
+        let trial_state = trial.sls_state.expect("SLS returned a stateless trial");
+        assert!((trial_state.transient_force() - expected_state).abs() < 1.0e-12);
+        assert!((trial.response.force - (3_000.0 + expected_state)).abs() < 1.0e-12);
+        assert!((trial.response.rate_tangent - 75.0 / denominator).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn stateless_backward_euler_trial_has_no_internal_state() {
+        let material = AxialMaterial::Hooke(Hooke::new(30_000.0));
+        let trial = material.backward_euler_trial(KINEMATICS, None, REST_LENGTH, 0.01);
+
+        assert!(trial.sls_state.is_none());
+        assert_eq!(trial.response.force, 3_000.0);
     }
 }
