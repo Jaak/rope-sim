@@ -10,7 +10,8 @@ use crate::state::State;
 use super::newton_block_pentadiagonal::NewtonBlockPentadiagonalSolver;
 use super::{
     AccelerationJacobianBlock, DynamicalSystem, IntegratorStatistics, StepError, TimeIntegrator,
-    validate_timestep,
+    VelocityResidualMetrics, VelocityResidualTolerance, infinity_norm, record_converged_residual,
+    validate_timestep, velocity_residual_metrics,
 };
 
 const GAMMA: f64 = 2.0 - std::f64::consts::SQRT_2;
@@ -20,7 +21,10 @@ const INITIAL_STAGE_WEIGHT: f64 = 1.0 - BDF_STAGE_WEIGHT;
 const MAX_NEWTON_ITERATIONS: usize = 16;
 const MAX_LINE_SEARCH_ITERATIONS: usize = 10;
 const MAX_ADAPTIVE_RETRY_LEVELS: usize = 4;
-const RESIDUAL_TOLERANCE: f64 = 1.0e-8;
+const VELOCITY_RESIDUAL_TOLERANCE: VelocityResidualTolerance = VelocityResidualTolerance {
+    absolute: 1.0e-6,
+    relative: 1.0e-6,
+};
 const NOT_DYNAMIC: usize = usize::MAX;
 
 pub(super) struct TrBdf2 {
@@ -149,6 +153,8 @@ impl TimeIntegrator for TrBdf2 {
         };
 
         for retry_level in 0..=MAX_ADAPTIVE_RETRY_LEVELS {
+            self.statistics.maximum_retry_level =
+                self.statistics.maximum_retry_level.max(retry_level as u64);
             if retry_level > 0 {
                 self.statistics.adaptive_retries += 1;
             }
@@ -273,7 +279,10 @@ impl StageSolver {
             return Ok(());
         }
 
-        let mut last_residual = f64::INFINITY;
+        let mut last_residual = VelocityResidualMetrics {
+            absolute: f64::INFINITY,
+            normalized: f64::INFINITY,
+        };
         for iteration in 0..MAX_NEWTON_ITERATIONS {
             statistics.nonlinear_iterations += 1;
             statistics.residual_evaluations += 1;
@@ -289,9 +298,16 @@ impl StageSolver {
                 &mut self.residual,
                 stage_time,
             );
-            last_residual = infinity_norm(&self.residual);
-            let scale = 1.0 + maximum_position_magnitude(&self.trial, &self.dynamic_nodes);
-            if last_residual <= RESIDUAL_TOLERANCE * scale {
+            last_residual = velocity_residual_metrics(
+                &self.residual,
+                dt,
+                output,
+                &self.trial,
+                &self.dynamic_nodes,
+                VELOCITY_RESIDUAL_TOLERANCE,
+            );
+            if last_residual.normalized <= 1.0 {
+                record_converged_residual(statistics, last_residual);
                 output.clone_from(&self.trial);
                 return Ok(());
             }
@@ -341,6 +357,7 @@ impl StageSolver {
 
             let mut accepted = false;
             let mut step_scale = 1.0;
+            let line_search_residual = infinity_norm(&self.residual);
             for _ in 0..MAX_LINE_SEARCH_ITERATIONS {
                 for index in 0..dimension {
                     let node = self.dynamic_nodes[index / 2];
@@ -363,7 +380,9 @@ impl StageSolver {
                     &mut self.candidate_residual,
                     stage_time,
                 );
-                if infinity_norm(&self.candidate_residual) < last_residual {
+                // Do not let a candidate buy a lower normalized residual by
+                // increasing its own velocity scale.
+                if infinity_norm(&self.candidate_residual) < line_search_residual {
                     accepted = true;
                     break;
                 }
@@ -371,16 +390,31 @@ impl StageSolver {
                 step_scale *= 0.5;
             }
             if !accepted {
+                statistics.failed_line_searches += 1;
                 return Err(StepError::NewtonDidNotConverge {
                     iterations: iteration + 1,
-                    residual: last_residual,
+                    residual: last_residual.absolute,
                 });
+            }
+
+            last_residual = velocity_residual_metrics(
+                &self.candidate_residual,
+                dt,
+                output,
+                &self.trial,
+                &self.dynamic_nodes,
+                VELOCITY_RESIDUAL_TOLERANCE,
+            );
+            if last_residual.normalized <= 1.0 {
+                record_converged_residual(statistics, last_residual);
+                output.clone_from(&self.trial);
+                return Ok(());
             }
         }
 
         Err(StepError::NewtonDidNotConverge {
             iterations: MAX_NEWTON_ITERATIONS,
-            residual: last_residual,
+            residual: last_residual.absolute,
         })
     }
 }
@@ -480,16 +514,6 @@ fn solve_sparse_system(
     } else {
         Err(StepError::SingularJacobian)
     }
-}
-
-fn infinity_norm(values: &[f64]) -> f64 {
-    values.iter().fold(0.0, |norm, value| norm.max(value.abs()))
-}
-
-fn maximum_position_magnitude(state: &State, dynamic_nodes: &[usize]) -> f64 {
-    dynamic_nodes.iter().fold(0.0, |maximum, &node| {
-        maximum.max(state.positions[node].length())
-    })
 }
 
 fn component_value(vector: Vec2, component: usize) -> f64 {

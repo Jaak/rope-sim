@@ -290,14 +290,12 @@ mod tests {
     #[test]
     fn short_fixture_run_is_finite() {
         let measurements = run_dynamic_rope_calibration(
-            SimulationConfig {
-                rope_model: crate::RopeModelKind::HookeSpring,
-                ..SimulationConfig::default()
-            },
+            SimulationConfig::default()
+                .with_recommended_rope_model(crate::RopeModelKind::StandardLinearSolid),
             VOLTA_GUIDE_9MM,
             CalibrationSettings {
-                segment_count: 4,
-                timestep: 1.0 / 240.0,
+                segment_count: 64,
+                timestep: 1.0 / 960.0,
                 static_duration: 0.05,
                 dynamic_duration: 0.05,
             },

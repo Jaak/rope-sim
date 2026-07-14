@@ -39,6 +39,11 @@ pub struct Diagnostics {
     pub block_factorizations: u64,
     pub sparse_factorizations: u64,
     pub line_search_backtracks: u64,
+    pub failed_line_searches: u64,
+    pub stagnation_acceptances: u64,
+    pub maximum_retry_level: u64,
+    pub last_velocity_residual: f64,
+    pub last_normalized_residual: f64,
     pub manipulation_corrections: u64,
     pub manipulation_correction_fallbacks: u64,
     pub manipulation_release_handoffs: u64,
@@ -285,7 +290,9 @@ impl Simulation {
         self.manipulation_correction_accumulator = 0.0;
         let start = KinematicTarget::new(self.payload_position(), self.payload_velocity());
         self.payload_target = Some(start);
-        self.payload_motion = Some(KinematicMotion::new(start, target, duration));
+        self.payload_motion = Some(KinematicMotion::new_left_continuous(
+            start, target, duration,
+        ));
         Ok(())
     }
 
@@ -556,6 +563,11 @@ impl Simulation {
             block_factorizations: statistics.block_factorizations,
             sparse_factorizations: statistics.sparse_factorizations,
             line_search_backtracks: statistics.line_search_backtracks,
+            failed_line_searches: statistics.failed_line_searches,
+            stagnation_acceptances: statistics.stagnation_acceptances,
+            maximum_retry_level: statistics.maximum_retry_level,
+            last_velocity_residual: statistics.last_velocity_residual,
+            last_normalized_residual: statistics.last_normalized_residual,
             manipulation_corrections: self.manipulation_corrections,
             manipulation_correction_fallbacks: self.manipulation_correction_fallbacks,
             manipulation_release_handoffs: self.manipulation_release_handoffs,
@@ -618,6 +630,9 @@ impl Simulation {
         let (target, finished) = motion.advance(dt);
         self.payload_target = Some(target);
         if finished {
+            let payload = self.payload_index();
+            self.state.positions[payload] = target.position;
+            self.state.velocities[payload] = target.velocity;
             self.payload_motion = None;
         }
     }

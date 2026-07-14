@@ -548,6 +548,36 @@ impl RopeSimApp {
                                         );
                                         diagnostic_row(
                                             ui,
+                                            "Deepest retry",
+                                            self.diagnostics.maximum_retry_level as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Failed line searches",
+                                            self.diagnostics.failed_line_searches as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Stagnation accepts",
+                                            self.diagnostics.stagnation_acceptances as f64,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Last velocity residual",
+                                            self.diagnostics.last_velocity_residual,
+                                            "m/s",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Last normalized residual",
+                                            self.diagnostics.last_normalized_residual,
+                                            "",
+                                        );
+                                        diagnostic_row(
+                                            ui,
                                             "Hybrid corrections",
                                             self.diagnostics.manipulation_corrections as f64,
                                             "",

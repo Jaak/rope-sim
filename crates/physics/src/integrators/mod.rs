@@ -94,7 +94,7 @@ pub(crate) trait TimeIntegrator {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct IntegratorStatistics {
     pub rejected_steps: u64,
     pub linear_solves: u64,
@@ -105,6 +105,11 @@ pub(crate) struct IntegratorStatistics {
     pub block_factorizations: u64,
     pub sparse_factorizations: u64,
     pub line_search_backtracks: u64,
+    pub failed_line_searches: u64,
+    pub stagnation_acceptances: u64,
+    pub maximum_retry_level: u64,
+    pub last_velocity_residual: f64,
+    pub last_normalized_residual: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -181,5 +186,96 @@ pub(super) fn validate_timestep(dt: f64) -> Result<(), StepError> {
         Err(StepError::InvalidTimeStep(dt))
     } else {
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VelocityResidualTolerance {
+    pub absolute: f64,
+    pub relative: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VelocityResidualMetrics {
+    /// Maximum two-dimensional node defect, in metres per second.
+    pub absolute: f64,
+    /// Maximum defect divided by that node's absolute/relative tolerance.
+    pub normalized: f64,
+}
+
+/// Measure a position-form implicit residual as a per-node velocity defect.
+///
+/// Scaling the residual and Jacobian by `1 / dt` leaves the Newton correction
+/// unchanged. Each 2D node is weighted independently so a fast payload cannot
+/// loosen convergence for stationary nodes elsewhere in the rope.
+pub(super) fn velocity_residual_metrics(
+    position_residual: &[f64],
+    dt: f64,
+    reference: &State,
+    trial: &State,
+    dynamic_nodes: &[usize],
+    tolerance: VelocityResidualTolerance,
+) -> VelocityResidualMetrics {
+    debug_assert_eq!(position_residual.len(), 2 * dynamic_nodes.len());
+    let mut absolute: f64 = 0.0;
+    let mut normalized: f64 = 0.0;
+
+    for (components, &node) in position_residual.chunks_exact(2).zip(dynamic_nodes) {
+        let defect = Vec2::new(components[0], components[1]).length() / dt;
+        let speed = reference.velocities[node]
+            .length()
+            .max(trial.velocities[node].length());
+        let scale = tolerance.absolute + tolerance.relative * speed;
+        absolute = absolute.max(defect);
+        normalized = normalized.max(defect / scale);
+    }
+
+    VelocityResidualMetrics {
+        absolute,
+        normalized,
+    }
+}
+
+pub(super) fn infinity_norm(values: &[f64]) -> f64 {
+    values.iter().fold(0.0, |norm, value| norm.max(value.abs()))
+}
+
+pub(super) fn record_converged_residual(
+    statistics: &mut IntegratorStatistics,
+    residual: VelocityResidualMetrics,
+) {
+    statistics.last_velocity_residual = residual.absolute;
+    statistics.last_normalized_residual = residual.normalized;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VelocityResidualTolerance, velocity_residual_metrics};
+    use crate::math::Vec2;
+    use crate::state::State;
+
+    #[test]
+    fn velocity_residual_is_weighted_per_two_dimensional_node() {
+        let mut reference = State::new(vec![Vec2::ZERO; 2]);
+        reference.velocities[1] = Vec2::new(100.0, 0.0);
+        let trial = reference.clone();
+        let tolerance = VelocityResidualTolerance {
+            absolute: 1.0e-6,
+            relative: 1.0e-6,
+        };
+
+        // The stationary node has a 3-4-5 micrometre-per-second defect. The
+        // unrelated fast node must not loosen its tolerance.
+        let metrics = velocity_residual_metrics(
+            &[3.0e-6, 4.0e-6, 0.0, 0.0],
+            1.0,
+            &reference,
+            &trial,
+            &[0, 1],
+            tolerance,
+        );
+
+        assert!((metrics.absolute - 5.0e-6).abs() < 1.0e-15);
+        assert!((metrics.normalized - 5.0).abs() < 1.0e-12);
     }
 }

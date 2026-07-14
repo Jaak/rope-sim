@@ -9,15 +9,36 @@ use crate::state::State;
 use super::newton_block_pentadiagonal::NewtonBlockPentadiagonalSolver;
 use super::{
     AccelerationJacobianBlock, DynamicalSystem, IntegratorStatistics, StepError, TimeIntegrator,
-    validate_timestep,
+    VelocityResidualMetrics, VelocityResidualTolerance, infinity_norm, record_converged_residual,
+    validate_timestep, velocity_residual_metrics,
 };
 
 const MAX_NEWTON_ITERATIONS: usize = 12;
 const MAX_LINE_SEARCH_ITERATIONS: usize = 10;
 const MAX_ADAPTIVE_RETRY_LEVELS: usize = 6;
-const RESIDUAL_TOLERANCE: f64 = 1.0e-8;
-const INTERACTION_RESIDUAL_TOLERANCE: f64 = 1.0e-5;
+// The looser value is considered only after every line-search candidate fails
+// to reduce an already small defect; it cannot accept the initial predictor.
+const VELOCITY_RESIDUAL_TOLERANCE: NewtonTolerance = NewtonTolerance {
+    convergence: VelocityResidualTolerance {
+        absolute: 1.0e-6,
+        relative: 1.0e-6,
+    },
+    stagnation: Some(2.5e-4),
+};
+const INTERACTION_VELOCITY_RESIDUAL_TOLERANCE: NewtonTolerance = NewtonTolerance {
+    convergence: VelocityResidualTolerance {
+        absolute: 5.0e-3,
+        relative: 5.0e-3,
+    },
+    stagnation: None,
+};
 const NOT_DYNAMIC: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
+struct NewtonTolerance {
+    convergence: VelocityResidualTolerance,
+    stagnation: Option<f64>,
+}
 
 pub(crate) struct BackwardEuler {
     backup: State,
@@ -213,7 +234,7 @@ impl BackwardEuler {
             dt,
             0.0,
             maximum_iterations,
-            INTERACTION_RESIDUAL_TOLERANCE,
+            INTERACTION_VELOCITY_RESIDUAL_TOLERANCE,
         )
     }
 
@@ -233,7 +254,7 @@ impl BackwardEuler {
             dt,
             0.0,
             MAX_NEWTON_ITERATIONS,
-            RESIDUAL_TOLERANCE,
+            VELOCITY_RESIDUAL_TOLERANCE,
         )
     }
 
@@ -252,7 +273,7 @@ impl BackwardEuler {
             dt,
             start_time,
             MAX_NEWTON_ITERATIONS,
-            RESIDUAL_TOLERANCE,
+            VELOCITY_RESIDUAL_TOLERANCE,
         )? {
             PredictorCorrection::Converged => Ok(()),
             PredictorCorrection::BudgetExceeded {
@@ -272,7 +293,7 @@ impl BackwardEuler {
         dt: f64,
         start_time: f64,
         maximum_iterations: usize,
-        residual_tolerance: f64,
+        residual_tolerance: NewtonTolerance,
     ) -> Result<PredictorCorrection, StepError> {
         let end_time = start_time + dt;
 
@@ -283,7 +304,10 @@ impl BackwardEuler {
         }
 
         let dimension = self.residual.len();
-        let mut last_residual = f64::INFINITY;
+        let mut last_residual = VelocityResidualMetrics {
+            absolute: f64::INFINITY,
+            normalized: f64::INFINITY,
+        };
         for iteration in 0..maximum_iterations {
             self.statistics.nonlinear_iterations += 1;
             self.statistics.residual_evaluations += 1;
@@ -297,9 +321,16 @@ impl BackwardEuler {
                 &mut self.residual,
                 end_time,
             );
-            last_residual = infinity_norm(&self.residual);
-            let scale = 1.0 + maximum_position_magnitude(&self.trial, &self.dynamic_nodes);
-            if last_residual <= residual_tolerance * scale {
+            last_residual = velocity_residual_metrics(
+                &self.residual,
+                dt,
+                &self.initial,
+                &self.trial,
+                &self.dynamic_nodes,
+                residual_tolerance.convergence,
+            );
+            if last_residual.normalized <= 1.0 {
+                record_converged_residual(&mut self.statistics, last_residual);
                 self.finish(system, state, end_time)?;
                 return Ok(PredictorCorrection::Converged);
             }
@@ -350,6 +381,7 @@ impl BackwardEuler {
 
             let mut accepted = false;
             let mut step_scale = 1.0;
+            let line_search_residual = infinity_norm(&self.residual);
             for _ in 0..MAX_LINE_SEARCH_ITERATIONS {
                 for index in 0..dimension {
                     let node = self.dynamic_nodes[index / 2];
@@ -371,7 +403,11 @@ impl BackwardEuler {
                     &mut self.candidate_residual,
                     end_time,
                 );
-                if infinity_norm(&self.candidate_residual) < last_residual {
+                // Keep the line-search merit function unweighted. If the
+                // candidate's velocity also defined the comparison, a very
+                // fast bad candidate could appear better merely because its
+                // relative tolerance is larger.
+                if infinity_norm(&self.candidate_residual) < line_search_residual {
                     accepted = true;
                     break;
                 }
@@ -380,16 +416,59 @@ impl BackwardEuler {
             }
 
             if !accepted {
+                self.statistics.failed_line_searches += 1;
+                if residual_tolerance
+                    .stagnation
+                    .is_some_and(|tolerance| last_residual.absolute <= tolerance)
+                {
+                    for index in 0..dimension {
+                        let node = self.dynamic_nodes[index / 2];
+                        set_component(
+                            &mut self.trial.positions[node],
+                            index % 2,
+                            self.base_unknowns[index],
+                        );
+                    }
+                    self.statistics.residual_evaluations += 1;
+                    evaluate_residual(
+                        system,
+                        &self.initial,
+                        &mut self.trial,
+                        &self.dynamic_nodes,
+                        dt,
+                        &mut self.accelerations,
+                        &mut self.residual,
+                        end_time,
+                    );
+                    last_residual = velocity_residual_metrics(
+                        &self.residual,
+                        dt,
+                        &self.initial,
+                        &self.trial,
+                        &self.dynamic_nodes,
+                        residual_tolerance.convergence,
+                    );
+                    self.statistics.stagnation_acceptances += 1;
+                    record_converged_residual(&mut self.statistics, last_residual);
+                    self.finish(system, state, end_time)?;
+                    return Ok(PredictorCorrection::Converged);
+                }
                 return Ok(PredictorCorrection::BudgetExceeded {
                     iterations: iteration + 1,
-                    residual: last_residual,
+                    residual: last_residual.absolute,
                 });
             }
 
-            last_residual = infinity_norm(&self.candidate_residual);
-            let candidate_scale =
-                1.0 + maximum_position_magnitude(&self.trial, &self.dynamic_nodes);
-            if last_residual <= residual_tolerance * candidate_scale {
+            last_residual = velocity_residual_metrics(
+                &self.candidate_residual,
+                dt,
+                &self.initial,
+                &self.trial,
+                &self.dynamic_nodes,
+                residual_tolerance.convergence,
+            );
+            if last_residual.normalized <= 1.0 {
+                record_converged_residual(&mut self.statistics, last_residual);
                 self.finish(system, state, end_time)?;
                 return Ok(PredictorCorrection::Converged);
             }
@@ -397,7 +476,7 @@ impl BackwardEuler {
 
         Ok(PredictorCorrection::BudgetExceeded {
             iterations: maximum_iterations,
-            residual: last_residual,
+            residual: last_residual.absolute,
         })
     }
 }
@@ -419,6 +498,8 @@ impl TimeIntegrator for BackwardEuler {
         };
 
         for retry_level in 0..=MAX_ADAPTIVE_RETRY_LEVELS {
+            self.statistics.maximum_retry_level =
+                self.statistics.maximum_retry_level.max(retry_level as u64);
             if retry_level > 0 {
                 self.statistics.adaptive_retries += 1;
             }
@@ -579,16 +660,6 @@ fn solve_sparse_system(
     } else {
         Err(StepError::SingularJacobian)
     }
-}
-
-fn infinity_norm(values: &[f64]) -> f64 {
-    values.iter().fold(0.0, |norm, value| norm.max(value.abs()))
-}
-
-fn maximum_position_magnitude(state: &State, dynamic_nodes: &[usize]) -> f64 {
-    dynamic_nodes.iter().fold(0.0, |maximum, &node| {
-        maximum.max(state.positions[node].length())
-    })
 }
 
 fn component_value(vector: Vec2, component: usize) -> f64 {

@@ -173,6 +173,71 @@ fn fixed_anchor_never_moves() {
 }
 
 #[test]
+fn implicit_integrators_resolve_gravity_at_deep_retry_timestep() {
+    let dt = (1.0 / 240.0) / 64.0;
+    for integrator in [IntegratorKind::BackwardEuler, IntegratorKind::TrBdf2] {
+        let mut simulation = Simulation::new(SimulationConfig {
+            segment_count: 1,
+            axial_rigidity: 1.0,
+            rope_model: RopeModelKind::HookeSpring,
+            air_damping_rate: 0.0,
+            integrator,
+            ..SimulationConfig::default()
+        })
+        .unwrap();
+
+        simulation.step(dt).unwrap();
+
+        let expected_velocity = -9.81 * dt;
+        let actual_velocity = simulation.velocities()[1].y;
+        assert!(
+            (actual_velocity - expected_velocity).abs() < 1.0e-9,
+            "{} produced {actual_velocity:e} m/s instead of {expected_velocity:e} m/s",
+            integrator.display_name()
+        );
+    }
+}
+
+#[test]
+fn implicit_convergence_is_independent_of_world_translation() {
+    fn payload_state(integrator: IntegratorKind, anchor: Vec2) -> (Vec2, Vec2) {
+        let mut simulation = Simulation::new(SimulationConfig {
+            segment_count: 1,
+            axial_rigidity: 1.0,
+            rope_model: RopeModelKind::HookeSpring,
+            air_damping_rate: 0.0,
+            anchor,
+            integrator,
+            ..SimulationConfig::default()
+        })
+        .unwrap();
+        simulation.step(5.0e-4).unwrap();
+        (
+            simulation.payload_position() - anchor,
+            simulation.payload_velocity(),
+        )
+    }
+
+    let translation = Vec2::new(10_000.0, -10_000.0);
+    for integrator in [IntegratorKind::BackwardEuler, IntegratorKind::TrBdf2] {
+        let local = payload_state(integrator, Vec2::ZERO);
+        let translated = payload_state(integrator, translation);
+        let position_difference = (local.0 - translated.0).length();
+        let velocity_difference = (local.1 - translated.1).length();
+        assert!(
+            position_difference < 1.0e-8,
+            "{} changed position by {position_difference:e} m under translation",
+            integrator.display_name()
+        );
+        assert!(
+            velocity_difference < 1.0e-7,
+            "{} changed velocity by {velocity_difference:e} m/s under translation",
+            integrator.display_name()
+        );
+    }
+}
+
+#[test]
 fn xpbd_manipulation_pins_the_payload_and_preserves_boundary_velocity() {
     let mut simulation = Simulation::new(SimulationConfig {
         segment_count: 8,
@@ -837,50 +902,60 @@ fn tr_bdf2_advances_the_default_rope_without_substeps() {
 
 #[test]
 fn tr_bdf2_is_second_order_for_a_single_axial_oscillator() {
-    fn error(dt: f64) -> f64 {
-        let config = SimulationConfig {
-            segment_count: 1,
-            rope_length: 1.0,
-            rope_mass: 0.001,
-            payload_mass: 1.0,
-            axial_rigidity: 100.0,
-            rope_model: RopeModelKind::HookeSpring,
-            gravity: Vec2::ZERO,
-            air_damping_rate: 0.0,
-            integrator: IntegratorKind::TrBdf2,
-            ..SimulationConfig::default()
-        };
-        let mut simulation = Simulation::new(config).unwrap();
-        let extension = 0.1;
-        simulation.set_payload_target(Some(KinematicTarget::new(
-            Vec2::new(0.0, -(config.rope_length + extension)),
-            Vec2::ZERO,
-        )));
-        simulation.release_payload(Vec2::ZERO);
-
-        let duration = 0.5;
-        let steps = (duration / dt) as usize;
-        for _ in 0..steps {
-            simulation.step(dt).unwrap();
-        }
-
-        let mass = config.payload_mass + 0.5 * config.rope_mass;
-        let frequency = (config.axial_rigidity / config.rope_length / mass).sqrt();
-        let exact_extension = extension * (frequency * duration).cos();
-        let exact_velocity = -extension * frequency * (frequency * duration).sin();
-        let actual_extension = -simulation.payload_position().y - config.rope_length;
-        let actual_velocity = -simulation.payload_velocity().y;
-        ((actual_extension - exact_extension).powi(2)
-            + ((actual_velocity - exact_velocity) / frequency).powi(2))
-        .sqrt()
-    }
-
-    let coarse = error(0.02);
-    let fine = error(0.01);
+    let coarse = single_axial_oscillator_error(IntegratorKind::TrBdf2, 0.02);
+    let fine = single_axial_oscillator_error(IntegratorKind::TrBdf2, 0.01);
     assert!(
         coarse > 3.5 * fine,
         "expected second-order convergence, coarse={coarse:e}, fine={fine:e}"
     );
+}
+
+#[test]
+fn backward_euler_is_first_order_for_a_single_axial_oscillator() {
+    let coarse = single_axial_oscillator_error(IntegratorKind::BackwardEuler, 0.02);
+    let fine = single_axial_oscillator_error(IntegratorKind::BackwardEuler, 0.01);
+    assert!(
+        coarse > 1.7 * fine,
+        "expected first-order convergence, coarse={coarse:e}, fine={fine:e}"
+    );
+}
+
+fn single_axial_oscillator_error(integrator: IntegratorKind, dt: f64) -> f64 {
+    let config = SimulationConfig {
+        segment_count: 1,
+        rope_length: 1.0,
+        rope_mass: 0.001,
+        payload_mass: 1.0,
+        axial_rigidity: 100.0,
+        rope_model: RopeModelKind::HookeSpring,
+        gravity: Vec2::ZERO,
+        air_damping_rate: 0.0,
+        integrator,
+        ..SimulationConfig::default()
+    };
+    let mut simulation = Simulation::new(config).unwrap();
+    let extension = 0.1;
+    simulation.set_payload_target(Some(KinematicTarget::new(
+        Vec2::new(0.0, -(config.rope_length + extension)),
+        Vec2::ZERO,
+    )));
+    simulation.release_payload(Vec2::ZERO);
+
+    let duration = 0.5;
+    let steps = (duration / dt) as usize;
+    for _ in 0..steps {
+        simulation.step(dt).unwrap();
+    }
+
+    let mass = config.payload_mass + 0.5 * config.rope_mass;
+    let frequency = (config.axial_rigidity / config.rope_length / mass).sqrt();
+    let exact_extension = extension * (frequency * duration).cos();
+    let exact_velocity = -extension * frequency * (frequency * duration).sin();
+    let actual_extension = -simulation.payload_position().y - config.rope_length;
+    let actual_velocity = -simulation.payload_velocity().y;
+    ((actual_extension - exact_extension).powi(2)
+        + ((actual_velocity - exact_velocity) / frequency).powi(2))
+    .sqrt()
 }
 
 #[test]

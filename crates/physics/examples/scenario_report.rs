@@ -96,6 +96,14 @@ fn report_run(
         metrics.final_diagnostics.adaptive_retries,
         metrics.final_diagnostics.line_search_backtracks,
     );
+    println!(
+        "  convergence: deepest retry {}, failed line searches {}, stagnation accepts {}, last residual {:.3e} m/s ({:.3e} normalized)",
+        metrics.final_diagnostics.maximum_retry_level,
+        metrics.final_diagnostics.failed_line_searches,
+        metrics.final_diagnostics.stagnation_acceptances,
+        metrics.final_diagnostics.last_velocity_residual,
+        metrics.final_diagnostics.last_normalized_residual,
+    );
     Ok(())
 }
 
