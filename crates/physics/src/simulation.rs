@@ -575,14 +575,14 @@ impl Simulation {
         let tension = self.segment_tension(left).unwrap_or(0.0);
         let mut prescribed_force = direction * tension;
         if (self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0)
-            && let Some(forces) = crate::dynamics::bending::forces(
-                &self.state,
-                left,
+            && let Some(geometry) = crate::dynamics::bending::geometry(&self.state, left)
+        {
+            let forces = crate::dynamics::bending::forces_from_geometry(
+                &geometry,
                 self.rest_length,
                 self.config.bending_rigidity,
                 self.config.bending_viscosity,
-            )
-        {
+            );
             // The prescribed endpoint supplies the reaction opposite to the
             // internal bending force on the payload.
             prescribed_force -= forces[2];

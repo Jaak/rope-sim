@@ -11,6 +11,7 @@ pub(crate) struct BendingGeometry {
     pub angle: f64,
     pub angle_rate: f64,
     pub(crate) gradients: [Vec2; 3],
+    velocities: [Vec2; 3],
     incoming: Vec2,
     outgoing: Vec2,
     incoming_length_squared: f64,
@@ -66,6 +67,7 @@ pub(crate) fn geometry(state: &State, center: usize) -> Option<BendingGeometry> 
         angle,
         angle_rate,
         gradients,
+        velocities,
         incoming,
         outgoing,
         incoming_length_squared,
@@ -78,20 +80,18 @@ pub(crate) fn geometry(state: &State, center: usize) -> Option<BendingGeometry> 
 /// Explicit integration and nonlinear residual evaluation only need forces.
 /// Keeping this path separate avoids constructing angle Hessians and nine
 /// local Jacobian blocks that those callers would immediately discard.
-pub(crate) fn forces(
-    state: &State,
-    center: usize,
+#[inline]
+pub(crate) fn forces_from_geometry(
+    geometry: &BendingGeometry,
     rest_length: f64,
     rigidity: f64,
     viscosity: f64,
-) -> Option<[Vec2; 3]> {
-    let geometry = geometry(state, center)?;
-    Some(forces_from_geometry(
-        geometry,
-        rest_length,
-        rigidity,
-        viscosity,
-    ))
+) -> [Vec2; 3] {
+    let generalized_moment =
+        rigidity * geometry.angle / rest_length + viscosity * geometry.angle_rate / rest_length;
+    geometry
+        .gradients
+        .map(|gradient| gradient * -generalized_moment)
 }
 
 /// Elastic and viscous bending forces and their exact local tangents.
@@ -99,13 +99,11 @@ pub(crate) fn forces(
 /// The elastic energy is `0.5 * B * angle^2 / rest_length`; the Rayleigh
 /// dissipation potential is `0.5 * C_B * angle_rate^2 / rest_length`.
 pub(crate) fn response(
-    state: &State,
-    center: usize,
+    geometry: &BendingGeometry,
     rest_length: f64,
     rigidity: f64,
     viscosity: f64,
-) -> Option<BendingResponse> {
-    let geometry = geometry(state, center)?;
+) -> BendingResponse {
     let elastic_scale = rigidity / rest_length;
     let viscous_scale = viscosity / rest_length;
     let incoming_angle_hessian = angle_hessian(geometry.incoming, geometry.incoming_length_squared);
@@ -114,14 +112,9 @@ pub(crate) fn response(
     add_edge_hessian(&mut angle_hessian, 0, -1.0, incoming_angle_hessian);
     add_edge_hessian(&mut angle_hessian, 1, 1.0, outgoing_angle_hessian);
 
-    let velocities = [
-        state.velocities[center - 1],
-        state.velocities[center],
-        state.velocities[center + 1],
-    ];
     let hessian_velocity: [Vec2; 3] = std::array::from_fn(|row| {
         let mut value = Vec2::ZERO;
-        for (column, velocity) in velocities.iter().enumerate() {
+        for (column, velocity) in geometry.velocities.iter().enumerate() {
             value += matrix2_vector_product(angle_hessian[row][column], *velocity);
         }
         value
@@ -150,23 +143,10 @@ pub(crate) fn response(
         }
     }
 
-    Some(BendingResponse {
+    BendingResponse {
         position_jacobian,
         velocity_jacobian,
-    })
-}
-
-fn forces_from_geometry(
-    geometry: BendingGeometry,
-    rest_length: f64,
-    rigidity: f64,
-    viscosity: f64,
-) -> [Vec2; 3] {
-    let generalized_moment =
-        rigidity * geometry.angle / rest_length + viscosity * geometry.angle_rate / rest_length;
-    geometry
-        .gradients
-        .map(|gradient| gradient * -generalized_moment)
+    }
 }
 
 fn add_edge_hessian(
@@ -210,10 +190,21 @@ mod tests {
         state
     }
 
+    fn evaluated_forces(state: &State, rigidity: f64, viscosity: f64) -> [Vec2; 3] {
+        let geometry = geometry(state, 1).unwrap();
+        forces_from_geometry(&geometry, REST_LENGTH, rigidity, viscosity)
+    }
+
+    fn evaluated_response(state: &State) -> BendingResponse {
+        let geometry = geometry(state, 1).unwrap();
+        response(&geometry, REST_LENGTH, RIGIDITY, VISCOSITY)
+    }
+
     #[test]
     fn straight_stationary_vertex_has_no_bending_force() {
         let state = State::new(vec![Vec2::new(-1.0, 0.0), Vec2::ZERO, Vec2::new(1.0, 0.0)]);
-        let forces = forces(&state, 1, 1.0, RIGIDITY, VISCOSITY).unwrap();
+        let geometry = geometry(&state, 1).unwrap();
+        let forces = forces_from_geometry(&geometry, 1.0, RIGIDITY, VISCOSITY);
 
         assert_eq!(forces, [Vec2::ZERO; 3]);
     }
@@ -221,7 +212,7 @@ mod tests {
     #[test]
     fn elastic_force_is_the_negative_bending_energy_gradient() {
         let state = bent_state();
-        let forces = forces(&state, 1, REST_LENGTH, RIGIDITY, 0.0).unwrap();
+        let forces = evaluated_forces(&state, RIGIDITY, 0.0);
         let step = 1.0e-6;
 
         for (node, force) in forces.iter().copied().enumerate() {
@@ -244,7 +235,7 @@ mod tests {
     #[test]
     fn bending_tangents_match_central_differences() {
         let state = bent_state();
-        let analytic_response = response(&state, 1, REST_LENGTH, RIGIDITY, VISCOSITY).unwrap();
+        let analytic_response = evaluated_response(&state);
         let step = 1.0e-6;
 
         for position_derivative in [true, false] {
@@ -264,8 +255,8 @@ mod tests {
                     };
                     *component_mut(plus_value, column_component) += step;
                     *component_mut(minus_value, column_component) -= step;
-                    let plus_force = forces(&plus, 1, REST_LENGTH, RIGIDITY, VISCOSITY).unwrap();
-                    let minus_force = forces(&minus, 1, REST_LENGTH, RIGIDITY, VISCOSITY).unwrap();
+                    let plus_force = evaluated_forces(&plus, RIGIDITY, VISCOSITY);
+                    let minus_force = evaluated_forces(&minus, RIGIDITY, VISCOSITY);
 
                     for row_node in 0..3 {
                         for row_component in 0..2 {
@@ -323,7 +314,7 @@ mod tests {
     #[test]
     fn bending_viscosity_never_adds_mechanical_power() {
         let state = bent_state();
-        let forces = forces(&state, 1, REST_LENGTH, 0.0, VISCOSITY).unwrap();
+        let forces = evaluated_forces(&state, 0.0, VISCOSITY);
         let power: f64 = forces
             .iter()
             .zip(&state.velocities)

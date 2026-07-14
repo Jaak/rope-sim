@@ -126,15 +126,15 @@ impl<'a> RopeDynamics<'a> {
 
         if self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0 {
             for center in 1..state.node_count().saturating_sub(1) {
-                let Some(response) = bending::response(
-                    state,
-                    center,
+                let Some(geometry) = bending::geometry(state, center) else {
+                    continue;
+                };
+                let response = bending::response(
+                    &geometry,
                     self.rest_length,
                     self.config.bending_rigidity,
                     self.config.bending_viscosity,
-                ) else {
-                    continue;
-                };
+                );
                 let nodes = [center - 1, center, center + 1];
                 for (local_row, &row_node) in nodes.iter().enumerate() {
                     if !self.is_dynamic_node(row_node) {
@@ -195,15 +195,15 @@ impl DynamicalSystem for RopeDynamics<'_> {
 
         if self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0 {
             for center in 1..state.node_count().saturating_sub(1) {
-                let Some(forces) = bending::forces(
-                    state,
-                    center,
+                let Some(geometry) = bending::geometry(state, center) else {
+                    continue;
+                };
+                let forces = bending::forces_from_geometry(
+                    &geometry,
                     self.rest_length,
                     self.config.bending_rigidity,
                     self.config.bending_viscosity,
-                ) else {
-                    continue;
-                };
+                );
                 let nodes = [center - 1, center, center + 1];
                 for (local, &node) in nodes.iter().enumerate() {
                     if self.is_dynamic_node(node) {
@@ -372,15 +372,15 @@ impl DynamicalSystem for RopeDynamics<'_> {
 
         if self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0 {
             for center in 1..state.node_count().saturating_sub(1) {
-                let Some(response) = bending::response(
-                    state,
-                    center,
+                let Some(geometry) = bending::geometry(state, center) else {
+                    continue;
+                };
+                let response = bending::response(
+                    &geometry,
                     self.rest_length,
                     self.config.bending_rigidity,
                     self.config.bending_viscosity,
-                ) else {
-                    continue;
-                };
+                );
                 let nodes = [center - 1, center, center + 1];
                 for (local_row, &row_node) in nodes.iter().enumerate() {
                     if !self.is_dynamic_node(row_node) {
