@@ -1,9 +1,9 @@
-use crate::math::Vec2;
+use crate::math::{
+    Matrix2, Vec2, ZERO_MATRIX2, angle_gradient, angle_hessian, cross, matrix2_add,
+    matrix2_add_scaled, matrix2_outer_product, matrix2_scale, matrix2_vector_product,
+};
 use crate::state::State;
 
-pub(crate) type Matrix2 = [[f64; 2]; 2];
-
-const ZERO_MATRIX: Matrix2 = [[0.0; 2]; 2];
 const MINIMUM_EDGE_LENGTH_SQUARED: f64 = 1.0e-18;
 
 #[derive(Clone, Copy, Debug)]
@@ -110,7 +110,7 @@ pub(crate) fn response(
     let viscous_scale = viscosity / rest_length;
     let incoming_angle_hessian = angle_hessian(geometry.incoming, geometry.incoming_length_squared);
     let outgoing_angle_hessian = angle_hessian(geometry.outgoing, geometry.outgoing_length_squared);
-    let mut angle_hessian = [[ZERO_MATRIX; 3]; 3];
+    let mut angle_hessian = [[ZERO_MATRIX2; 3]; 3];
     add_edge_hessian(&mut angle_hessian, 0, -1.0, incoming_angle_hessian);
     add_edge_hessian(&mut angle_hessian, 1, 1.0, outgoing_angle_hessian);
 
@@ -122,29 +122,29 @@ pub(crate) fn response(
     let hessian_velocity: [Vec2; 3] = std::array::from_fn(|row| {
         let mut value = Vec2::ZERO;
         for (column, velocity) in velocities.iter().enumerate() {
-            value += multiply_matrix_vector(angle_hessian[row][column], *velocity);
+            value += matrix2_vector_product(angle_hessian[row][column], *velocity);
         }
         value
     });
 
-    let mut position_jacobian = [[ZERO_MATRIX; 3]; 3];
-    let mut velocity_jacobian = [[ZERO_MATRIX; 3]; 3];
+    let mut position_jacobian = [[ZERO_MATRIX2; 3]; 3];
+    let mut velocity_jacobian = [[ZERO_MATRIX2; 3]; 3];
     for row in 0..3 {
         for column in 0..3 {
-            let elastic = add_matrix(
-                outer_product(geometry.gradients[row], geometry.gradients[column]),
-                scale_matrix(angle_hessian[row][column], geometry.angle),
+            let elastic = matrix2_add(
+                matrix2_outer_product(geometry.gradients[row], geometry.gradients[column]),
+                matrix2_scale(angle_hessian[row][column], geometry.angle),
             );
-            let viscous = add_matrix(
-                outer_product(geometry.gradients[row], hessian_velocity[column]),
-                scale_matrix(angle_hessian[row][column], geometry.angle_rate),
+            let viscous = matrix2_add(
+                matrix2_outer_product(geometry.gradients[row], hessian_velocity[column]),
+                matrix2_scale(angle_hessian[row][column], geometry.angle_rate),
             );
-            position_jacobian[row][column] = add_matrix(
-                scale_matrix(elastic, -elastic_scale),
-                scale_matrix(viscous, -viscous_scale),
+            position_jacobian[row][column] = matrix2_add(
+                matrix2_scale(elastic, -elastic_scale),
+                matrix2_scale(viscous, -viscous_scale),
             );
-            velocity_jacobian[row][column] = scale_matrix(
-                outer_product(geometry.gradients[row], geometry.gradients[column]),
+            velocity_jacobian[row][column] = matrix2_scale(
+                matrix2_outer_product(geometry.gradients[row], geometry.gradients[column]),
                 -viscous_scale,
             );
         }
@@ -169,28 +169,6 @@ fn forces_from_geometry(
         .map(|gradient| gradient * -generalized_moment)
 }
 
-fn cross(left: Vec2, right: Vec2) -> f64 {
-    left.x * right.y - left.y * right.x
-}
-
-fn angle_gradient(edge: Vec2, length_squared: f64) -> Vec2 {
-    Vec2::new(-edge.y / length_squared, edge.x / length_squared)
-}
-
-fn angle_hessian(edge: Vec2, length_squared: f64) -> Matrix2 {
-    let inverse_fourth_power = 1.0 / (length_squared * length_squared);
-    [
-        [
-            2.0 * edge.x * edge.y * inverse_fourth_power,
-            (edge.y * edge.y - edge.x * edge.x) * inverse_fourth_power,
-        ],
-        [
-            (edge.y * edge.y - edge.x * edge.x) * inverse_fourth_power,
-            -2.0 * edge.x * edge.y * inverse_fourth_power,
-        ],
-    ]
-}
-
 fn add_edge_hessian(
     output: &mut [[Matrix2; 3]; 3],
     first_node: usize,
@@ -201,41 +179,11 @@ fn add_edge_hessian(
     for local_row in 0..2 {
         for local_column in 0..2 {
             let scale = angle_sign * position_signs[local_row] * position_signs[local_column];
-            add_scaled_matrix(
+            matrix2_add_scaled(
                 &mut output[first_node + local_row][first_node + local_column],
                 edge_hessian,
                 scale,
             );
-        }
-    }
-}
-
-fn outer_product(left: Vec2, right: Vec2) -> Matrix2 {
-    [
-        [left.x * right.x, left.x * right.y],
-        [left.y * right.x, left.y * right.y],
-    ]
-}
-
-fn multiply_matrix_vector(matrix: Matrix2, vector: Vec2) -> Vec2 {
-    Vec2::new(
-        matrix[0][0] * vector.x + matrix[0][1] * vector.y,
-        matrix[1][0] * vector.x + matrix[1][1] * vector.y,
-    )
-}
-
-fn scale_matrix(matrix: Matrix2, scale: f64) -> Matrix2 {
-    matrix.map(|row| row.map(|value| value * scale))
-}
-
-fn add_matrix(left: Matrix2, right: Matrix2) -> Matrix2 {
-    std::array::from_fn(|row| std::array::from_fn(|column| left[row][column] + right[row][column]))
-}
-
-fn add_scaled_matrix(output: &mut Matrix2, input: Matrix2, scale: f64) {
-    for row in 0..2 {
-        for column in 0..2 {
-            output[row][column] += scale * input[row][column];
         }
     }
 }

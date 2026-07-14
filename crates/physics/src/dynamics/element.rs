@@ -1,5 +1,5 @@
 use crate::materials::{AxialKinematics, AxialResponse};
-use crate::math::Vec2;
+use crate::math::{Matrix2, Vec2, matrix2_vector_product};
 use crate::state::State;
 
 #[derive(Clone, Copy)]
@@ -49,7 +49,7 @@ pub(super) fn extension_rate(state: &State, left: usize) -> f64 {
 pub(super) fn force_jacobians(
     kinematics: ElementKinematics,
     response: AxialResponse,
-) -> ([[f64; 2]; 2], [[f64; 2]; 2]) {
+) -> (Matrix2, Matrix2) {
     let direction = kinematics.direction;
     let inverse_length = 1.0 / kinematics.length;
     let projection = [
@@ -62,12 +62,7 @@ pub(super) fn force_jacobians(
             (1.0 - direction.y * direction.y) * inverse_length,
         ],
     ];
-    let projected_velocity = Vec2::new(
-        projection[0][0] * kinematics.relative_velocity.x
-            + projection[0][1] * kinematics.relative_velocity.y,
-        projection[1][0] * kinematics.relative_velocity.x
-            + projection[1][1] * kinematics.relative_velocity.y,
-    );
+    let projected_velocity = matrix2_vector_product(projection, kinematics.relative_velocity);
     let direction_components = [direction.x, direction.y];
     let projected_velocity_components = [projected_velocity.x, projected_velocity.y];
     let mut position_jacobian = [[0.0; 2]; 2];

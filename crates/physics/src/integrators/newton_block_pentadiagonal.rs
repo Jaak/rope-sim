@@ -1,10 +1,8 @@
-use crate::math::Vec2;
+use crate::math::{Matrix2, Vec2, ZERO_MATRIX2, matrix2_subtract_product, matrix2_vector_product};
 
 use super::{AccelerationJacobianBlock, StepError};
 
 const NOT_DYNAMIC: usize = usize::MAX;
-type Matrix2 = [[f64; 2]; 2];
-const ZERO_MATRIX2: Matrix2 = [[0.0; 2]; 2];
 
 /// Solves the position-only Newton systems produced by the implicit integrators.
 ///
@@ -105,13 +103,13 @@ impl NewtonBlockPentadiagonalSolver {
                     solve_matrix2_columns(self.diagonal[index], self.reduced_second_upper[index])?;
             }
             if index + 1 < block_count {
-                self.diagonal[index + 1] = subtract_matrix_product(
+                self.diagonal[index + 1] = matrix2_subtract_product(
                     self.diagonal[index + 1],
                     self.lower[index],
                     self.reduced_upper[index],
                 );
                 if index + 2 < block_count {
-                    self.reduced_upper[index + 1] = subtract_matrix_product(
+                    self.reduced_upper[index + 1] = matrix2_subtract_product(
                         self.reduced_upper[index + 1],
                         self.lower[index],
                         self.reduced_second_upper[index],
@@ -119,12 +117,12 @@ impl NewtonBlockPentadiagonalSolver {
                 }
             }
             if index + 2 < block_count {
-                self.lower[index + 1] = subtract_matrix_product(
+                self.lower[index + 1] = matrix2_subtract_product(
                     self.lower[index + 1],
                     self.second_lower[index],
                     self.reduced_upper[index],
                 );
-                self.diagonal[index + 2] = subtract_matrix_product(
+                self.diagonal[index + 2] = matrix2_subtract_product(
                     self.diagonal[index + 2],
                     self.second_lower[index],
                     self.reduced_second_upper[index],
@@ -145,12 +143,12 @@ impl NewtonBlockPentadiagonalSolver {
             if index > 0 {
                 let previous = self.right_hand_side[index - 1];
                 self.right_hand_side[index] -=
-                    multiply_matrix_vector(self.lower[index - 1], previous);
+                    matrix2_vector_product(self.lower[index - 1], previous);
             }
             if index > 1 {
                 let previous = self.right_hand_side[index - 2];
                 self.right_hand_side[index] -=
-                    multiply_matrix_vector(self.second_lower[index - 2], previous);
+                    matrix2_vector_product(self.second_lower[index - 2], previous);
             }
             self.right_hand_side[index] =
                 solve_matrix2(self.diagonal[index], self.right_hand_side[index])?;
@@ -158,11 +156,11 @@ impl NewtonBlockPentadiagonalSolver {
 
         for index in (0..block_count.saturating_sub(1)).rev() {
             let next = self.right_hand_side[index + 1];
-            self.right_hand_side[index] -= multiply_matrix_vector(self.reduced_upper[index], next);
+            self.right_hand_side[index] -= matrix2_vector_product(self.reduced_upper[index], next);
             if index + 2 < block_count {
                 let second_next = self.right_hand_side[index + 2];
                 self.right_hand_side[index] -=
-                    multiply_matrix_vector(self.reduced_second_upper[index], second_next);
+                    matrix2_vector_product(self.reduced_second_upper[index], second_next);
             }
         }
         for (block, solution) in self.right_hand_side.iter().enumerate() {
@@ -203,24 +201,6 @@ fn solve_matrix2_columns(matrix: Matrix2, rhs: Matrix2) -> Result<Matrix2, StepE
     Ok([[first.x, second.x], [first.y, second.y]])
 }
 
-fn multiply_matrix_vector(matrix: Matrix2, vector: Vec2) -> Vec2 {
-    Vec2::new(
-        matrix[0][0] * vector.x + matrix[0][1] * vector.y,
-        matrix[1][0] * vector.x + matrix[1][1] * vector.y,
-    )
-}
-
-fn subtract_matrix_product(base: Matrix2, left: Matrix2, right: Matrix2) -> Matrix2 {
-    let mut output = base;
-    for row in 0..2 {
-        for column in 0..2 {
-            output[row][column] -=
-                left[row][0] * right[0][column] + left[row][1] * right[1][column];
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,18 +219,18 @@ mod tests {
         ];
         let mut residual = vec![0.0; 2 * expected.len()];
         for row in 0..expected.len() {
-            let mut value = multiply_matrix_vector(diagonal, expected[row]);
+            let mut value = matrix2_vector_product(diagonal, expected[row]);
             if row > 0 {
-                value += multiply_matrix_vector(lower, expected[row - 1]);
+                value += matrix2_vector_product(lower, expected[row - 1]);
             }
             if row + 1 < expected.len() {
-                value += multiply_matrix_vector(upper, expected[row + 1]);
+                value += matrix2_vector_product(upper, expected[row + 1]);
             }
             if row > 1 {
-                value += multiply_matrix_vector(second_lower, expected[row - 2]);
+                value += matrix2_vector_product(second_lower, expected[row - 2]);
             }
             if row + 2 < expected.len() {
-                value += multiply_matrix_vector(second_upper, expected[row + 2]);
+                value += matrix2_vector_product(second_upper, expected[row + 2]);
             }
             residual[2 * row] = -value.x;
             residual[2 * row + 1] = -value.y;

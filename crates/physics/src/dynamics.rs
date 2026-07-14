@@ -6,7 +6,7 @@ use crate::integrators::block_pentadiagonal::BlockPentadiagonalMatrix;
 use crate::integrators::{AccelerationJacobianBlock, DynamicalSystem};
 use crate::kinematics::{KinematicMotion, KinematicTarget};
 use crate::materials::{AxialKinematics, AxialMaterial, AxialResponse};
-use crate::math::Vec2;
+use crate::math::{Matrix2, Vec2};
 use crate::state::State;
 
 use element::{extension_rate, force_jacobians, kinematics, scalar_jacobians};
@@ -525,8 +525,8 @@ fn push_element_jacobian_row(
     output: &mut Vec<AccelerationJacobianBlock>,
     row_node: usize,
     column_node: usize,
-    force_position_jacobian: [[f64; 2]; 2],
-    force_velocity_jacobian: [[f64; 2]; 2],
+    force_position_jacobian: Matrix2,
+    force_velocity_jacobian: Matrix2,
     scale: f64,
 ) {
     output.push(AccelerationJacobianBlock {
@@ -541,8 +541,8 @@ fn add_force_jacobian_row(
     output: &mut BlockPentadiagonalMatrix,
     row_node: usize,
     column_node: usize,
-    force_position_jacobian: [[f64; 2]; 2],
-    force_velocity_jacobian: [[f64; 2]; 2],
+    force_position_jacobian: Matrix2,
+    force_velocity_jacobian: Matrix2,
     scale: f64,
 ) {
     for row in 0..2 {

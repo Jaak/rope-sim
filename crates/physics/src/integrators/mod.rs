@@ -9,7 +9,7 @@ mod tr_bdf2;
 use std::error::Error;
 use std::fmt;
 
-use crate::math::Vec2;
+use crate::math::{Matrix2, Vec2};
 use crate::state::State;
 
 use block_pentadiagonal::BlockPentadiagonalMatrix;
@@ -25,9 +25,9 @@ pub(crate) struct AccelerationJacobianBlock {
     pub row_node: usize,
     pub column_node: usize,
     /// Derivative of row-node acceleration with respect to column-node position.
-    pub position: [[f64; 2]; 2],
+    pub position: Matrix2,
     /// Derivative of row-node acceleration with respect to column-node velocity.
-    pub velocity: [[f64; 2]; 2],
+    pub velocity: Matrix2,
 }
 
 pub(crate) trait DynamicalSystem {
