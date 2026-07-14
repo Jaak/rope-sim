@@ -13,13 +13,14 @@ const SEGMENT_COUNTS: [usize; 4] = [64, 256, 512, 1_024];
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Run this benchmark with --release. Times are per 240 Hz physics step.");
     println!(
-        "{:<11} {:<10} {:>6} {:>10} {:>10} {:>10} {:>9} {:>9} {:>11} {:>11}",
+        "{:<11} {:<10} {:>6} {:>10} {:>10} {:>10} {:>8} {:>9} {:>9} {:>11} {:>11}",
         "phase",
         "model",
         "links",
         "mean us",
         "p50 us",
         "p99 us",
+        "substeps",
         "correct",
         "fallback",
         "last R",
@@ -31,15 +32,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         RopeModelKind::QuadraticKelvinVoigt,
     ] {
         for segment_count in SEGMENT_COUNTS {
-            let result = benchmark_hybrid_drag(segment_count, rope_model)?;
+            let result = benchmark_hybrid_drag(segment_count, rope_model, 0.0)?;
             print_result("hybrid", rope_model, segment_count, &result);
         }
     }
 
     for segment_count in SEGMENT_COUNTS {
-        let result = benchmark_free_backward_euler(segment_count)?;
+        let result =
+            benchmark_hybrid_drag(segment_count, RopeModelKind::StandardLinearSolid, 0.01)?;
+        print_result(
+            "bend hybrid",
+            RopeModelKind::StandardLinearSolid,
+            segment_count,
+            &result,
+        );
+    }
+
+    for segment_count in SEGMENT_COUNTS {
+        let result = benchmark_free(segment_count, 0.0, IntegratorKind::BackwardEuler)?;
         print_result(
             "free BE",
+            RopeModelKind::StandardLinearSolid,
+            segment_count,
+            &result,
+        );
+    }
+    for segment_count in SEGMENT_COUNTS {
+        let result = benchmark_free(segment_count, 0.01, IntegratorKind::BackwardEuler)?;
+        print_result(
+            "bend BE",
+            RopeModelKind::StandardLinearSolid,
+            segment_count,
+            &result,
+        );
+    }
+    for segment_count in [20, 40, 64] {
+        let result = benchmark_free(segment_count, 0.01, IntegratorKind::RungeKutta4)?;
+        print_result(
+            "bend RK4",
             RopeModelKind::StandardLinearSolid,
             segment_count,
             &result,
@@ -54,15 +84,19 @@ struct BenchmarkResult {
     fallbacks: u64,
     release: Option<Duration>,
     last_fallback_residual: f64,
+    maximum_substeps: usize,
 }
 
 fn benchmark_hybrid_drag(
     segment_count: usize,
     rope_model: RopeModelKind,
+    bending_rigidity: f64,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let mut simulation = Simulation::new(SimulationConfig {
         segment_count,
         rope_model,
+        bending_rigidity,
+        bending_viscosity: 0.1 * bending_rigidity,
         integrator: IntegratorKind::TrBdf2,
         ..SimulationConfig::default()
     })?;
@@ -91,26 +125,32 @@ fn benchmark_hybrid_drag(
             - before.manipulation_correction_fallbacks,
         release: Some(release),
         last_fallback_residual: after.manipulation_last_fallback_residual,
+        maximum_substeps: 1,
     })
 }
 
-fn benchmark_free_backward_euler(
+fn benchmark_free(
     segment_count: usize,
+    bending_rigidity: f64,
+    integrator: IntegratorKind,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let mut simulation = Simulation::new(SimulationConfig {
         segment_count,
         rope_model: RopeModelKind::StandardLinearSolid,
-        integrator: IntegratorKind::BackwardEuler,
+        bending_rigidity,
+        bending_viscosity: 0.1 * bending_rigidity,
+        integrator,
         ..SimulationConfig::default()
     })?;
+    let mut maximum_substeps = 1;
     for _ in 0..WARMUP_STEPS {
-        simulation.step_without_diagnostics(DT)?;
+        advance_outer_step(&mut simulation, &mut maximum_substeps)?;
     }
 
     let mut samples = Vec::with_capacity(TIMED_STEPS);
     for _ in 0..TIMED_STEPS {
         let start = Instant::now();
-        simulation.step_without_diagnostics(black_box(DT))?;
+        advance_outer_step(&mut simulation, &mut maximum_substeps)?;
         samples.push(start.elapsed());
     }
     Ok(BenchmarkResult {
@@ -119,7 +159,21 @@ fn benchmark_free_backward_euler(
         fallbacks: 0,
         release: None,
         last_fallback_residual: 0.0,
+        maximum_substeps,
     })
+}
+
+fn advance_outer_step(
+    simulation: &mut Simulation,
+    maximum_substeps: &mut usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let substeps = simulation.recommended_substeps(black_box(DT))?;
+    *maximum_substeps = (*maximum_substeps).max(substeps);
+    let dt = DT / substeps as f64;
+    for _ in 0..substeps {
+        simulation.step_without_diagnostics(dt)?;
+    }
+    Ok(())
 }
 
 fn drag_target(step: usize) -> KinematicTarget {
@@ -156,10 +210,11 @@ fn print_result(
         .release
         .map_or(0.0, |duration| duration.as_secs_f64() * 1.0e6);
     println!(
-        "{phase:<11} {:<10} {segment_count:>6} {mean:>10.1} {:>10.1} {:>10.1} {:>9} {:>9} {:>11.2e} {release:>11.1}",
+        "{phase:<11} {:<10} {segment_count:>6} {mean:>10.1} {:>10.1} {:>10.1} {:>8} {:>9} {:>9} {:>11.2e} {release:>11.1}",
         short_model_name(rope_model),
         percentile(0.50),
         percentile(0.99),
+        result.maximum_substeps,
         result.corrections,
         result.fallbacks,
         result.last_fallback_residual,

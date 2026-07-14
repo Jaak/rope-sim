@@ -56,6 +56,92 @@ fn every_rope_model_loads_its_own_recommended_parameters() {
 }
 
 #[test]
+fn bending_is_opt_in_and_old_configs_deserialize_to_axial_only() {
+    let config = SimulationConfig::default();
+    assert_eq!(config.bending_rigidity, 0.0);
+    assert_eq!(config.bending_viscosity, 0.0);
+
+    let mut json = serde_json::to_value(config).unwrap();
+    let object = json.as_object_mut().unwrap();
+    object.remove("bending_rigidity");
+    object.remove("bending_viscosity");
+    let restored: SimulationConfig = serde_json::from_value(json).unwrap();
+
+    assert_eq!(restored, config);
+}
+
+#[test]
+fn implicit_integrators_use_the_banded_solver_with_bending() {
+    for integrator in [IntegratorKind::BackwardEuler, IntegratorKind::TrBdf2] {
+        let mut simulation = Simulation::new(SimulationConfig {
+            segment_count: 20,
+            bending_rigidity: 0.01,
+            bending_viscosity: 0.001,
+            air_damping_rate: 0.05,
+            integrator,
+            ..SimulationConfig::default()
+        })
+        .unwrap();
+        simulation
+            .interpolate_payload_target(
+                KinematicTarget::new(Vec2::new(2.0, -10.0), Vec2::new(4.0, 4.0)),
+                0.5,
+            )
+            .unwrap();
+        let mut maximum_bending_energy = 0.0_f64;
+
+        for _ in 0..240 {
+            let outer_dt = 1.0 / 240.0;
+            let substeps = simulation.recommended_substeps(outer_dt).unwrap();
+            for _ in 0..substeps {
+                simulation.step(outer_dt / substeps as f64).unwrap();
+            }
+            maximum_bending_energy =
+                maximum_bending_energy.max(simulation.diagnostics().bending_energy);
+        }
+
+        let diagnostics = simulation.diagnostics();
+        assert!(maximum_bending_energy > 0.0);
+        assert!(diagnostics.block_factorizations > 0);
+        assert_eq!(diagnostics.sparse_factorizations, 0);
+        assert!(
+            simulation
+                .positions()
+                .iter()
+                .all(|position| position.is_finite())
+        );
+    }
+}
+
+#[test]
+fn xpbd_bending_changes_the_end_shortened_equilibrium() {
+    fn held_diagnostics(bending_rigidity: f64) -> ropesim_physics::Diagnostics {
+        let mut simulation = Simulation::new(SimulationConfig {
+            segment_count: 20,
+            bending_rigidity,
+            bending_viscosity: 0.001,
+            ..SimulationConfig::default()
+        })
+        .unwrap();
+        let target = KinematicTarget::new(Vec2::new(0.5, -6.0), Vec2::ZERO);
+        simulation.set_manipulation_target(target);
+        for _ in 0..480 {
+            simulation.step(1.0 / 240.0).unwrap();
+        }
+        simulation.diagnostics()
+    }
+
+    let axial_only = held_diagnostics(0.0);
+    let with_bending = held_diagnostics(0.1);
+    assert!(
+        (with_bending.maximum_curvature - axial_only.maximum_curvature).abs() > 0.1,
+        "bending did not materially change the held shape"
+    );
+    assert!(with_bending.bending_energy > 0.0);
+    assert!(with_bending.maximum_curvature.is_finite());
+}
+
+#[test]
 fn mass_distribution_preserves_total_mass() {
     let config = SimulationConfig::default();
     let simulation = Simulation::new(config).unwrap();
@@ -2089,6 +2175,18 @@ fn invalid_configuration_is_rejected() {
         result,
         Err(ConfigError::InvalidParameter {
             name: "axial viscosity",
+            ..
+        })
+    ));
+
+    let result = Simulation::new(SimulationConfig {
+        bending_rigidity: -1.0,
+        ..SimulationConfig::default()
+    });
+    assert!(matches!(
+        result,
+        Err(ConfigError::InvalidParameter {
+            name: "bending rigidity",
             ..
         })
     ));

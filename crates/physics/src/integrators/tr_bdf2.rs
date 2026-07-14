@@ -6,7 +6,7 @@ use faer::sparse::{SparseColMat, Triplet};
 use crate::math::Vec2;
 use crate::state::State;
 
-use super::newton_block_tridiagonal::NewtonBlockTridiagonalSolver;
+use super::newton_block_pentadiagonal::NewtonBlockPentadiagonalSolver;
 use super::{
     AccelerationJacobianBlock, DynamicalSystem, IntegratorStatistics, StepError, TimeIntegrator,
     validate_timestep,
@@ -203,7 +203,7 @@ struct StageSolver {
     symbolic_lu: Option<SymbolicLu<usize>>,
     delta: Vec<f64>,
     base_unknowns: Vec<f64>,
-    block_solver: NewtonBlockTridiagonalSolver,
+    block_solver: NewtonBlockPentadiagonalSolver,
 }
 
 impl StageSolver {
@@ -222,7 +222,7 @@ impl StageSolver {
             symbolic_lu: None,
             delta: Vec::new(),
             base_unknowns: Vec::new(),
-            block_solver: NewtonBlockTridiagonalSolver::new(node_count),
+            block_solver: NewtonBlockPentadiagonalSolver::new(node_count),
         }
     }
 

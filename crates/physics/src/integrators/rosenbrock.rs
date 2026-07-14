@@ -1,8 +1,8 @@
 use crate::math::Vec2;
 use crate::state::State;
 
-use super::block_tridiagonal::{
-    BLOCK_SIZE, BlockThomasSolver, BlockTridiagonalMatrix, BlockVector,
+use super::block_pentadiagonal::{
+    BLOCK_SIZE, BlockPentadiagonalMatrix, BlockPentadiagonalSolver, BlockVector,
 };
 use super::{DynamicalSystem, IntegratorStatistics, StepError, TimeIntegrator, validate_timestep};
 
@@ -16,8 +16,8 @@ pub(super) struct Rosenbrock2 {
     stage: State,
     accelerations: Vec<Vec2>,
     material_derivatives: Vec<f64>,
-    matrix: BlockTridiagonalMatrix,
-    solver: BlockThomasSolver,
+    matrix: BlockPentadiagonalMatrix,
+    solver: BlockPentadiagonalSolver,
     k1: Vec<BlockVector>,
     k2: Vec<BlockVector>,
     statistics: IntegratorStatistics,
@@ -31,8 +31,8 @@ impl Rosenbrock2 {
             stage: State::new(positions),
             accelerations: vec![Vec2::ZERO; node_count],
             material_derivatives: vec![0.0; node_count.saturating_sub(1)],
-            matrix: BlockTridiagonalMatrix::new(node_count),
-            solver: BlockThomasSolver::new(node_count),
+            matrix: BlockPentadiagonalMatrix::new(node_count),
+            solver: BlockPentadiagonalSolver::new(node_count),
             k1: vec![[0.0; BLOCK_SIZE]; node_count],
             k2: vec![[0.0; BLOCK_SIZE]; node_count],
             statistics: IntegratorStatistics::default(),

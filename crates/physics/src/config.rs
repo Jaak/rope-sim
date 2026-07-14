@@ -61,6 +61,18 @@ pub struct SimulationConfig {
     /// standard linear solid it sets the Maxwell relaxation time together with
     /// `transient_axial_rigidity`.
     pub axial_viscosity: f64,
+    /// Flexural rigidity B in newton-square-metres.
+    ///
+    /// Zero disables bending mechanics and exactly recovers the axial-only
+    /// rope model.
+    #[serde(default)]
+    pub bending_rigidity: f64,
+    /// Bending viscosity in newton-square-metre-seconds.
+    ///
+    /// This damps changes in the turning angle between adjacent elements.
+    /// Zero disables bending-rate damping.
+    #[serde(default)]
+    pub bending_viscosity: f64,
     /// Mass-proportional damping rate in inverse seconds.
     pub air_damping_rate: f64,
     /// Gravitational acceleration in metres per second squared.
@@ -86,6 +98,8 @@ impl Default for SimulationConfig {
             transient_axial_rigidity: SLS_TRANSIENT_RIGIDITY,
             rope_model: RopeModelKind::StandardLinearSolid,
             axial_viscosity: SLS_VISCOSITY,
+            bending_rigidity: 0.0,
+            bending_viscosity: 0.0,
             air_damping_rate: 0.0,
             gravity: Vec2::new(0.0, -9.81),
             anchor: Vec2::ZERO,
@@ -148,6 +162,8 @@ impl SimulationConfig {
         } else {
             validate_nonnegative("axial viscosity", self.axial_viscosity)?;
         }
+        validate_nonnegative("bending rigidity", self.bending_rigidity)?;
+        validate_nonnegative("bending viscosity", self.bending_viscosity)?;
 
         validate_nonnegative("air damping rate", self.air_damping_rate)?;
         if !self.gravity.is_finite() {

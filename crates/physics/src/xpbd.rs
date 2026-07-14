@@ -12,12 +12,14 @@ const MINIMUM_MANIPULATION_DAMPING_RATE: f64 = 0.5;
 /// This is an interaction aid, not a selectable constitutive time integrator.
 pub(crate) struct XpbdRopeRelaxer {
     multipliers: Vec<f64>,
+    bending_multipliers: Vec<f64>,
 }
 
 impl XpbdRopeRelaxer {
     pub(crate) fn new(node_count: usize) -> Self {
         Self {
             multipliers: vec![0.0; node_count.saturating_sub(1)],
+            bending_multipliers: vec![0.0; node_count.saturating_sub(2)],
         }
     }
 
@@ -45,6 +47,7 @@ impl XpbdRopeRelaxer {
         state.positions[payload] = target.position;
 
         self.multipliers.fill(0.0);
+        self.bending_multipliers.fill(0.0);
         self.project_constraints(
             config,
             state,
@@ -61,6 +64,7 @@ impl XpbdRopeRelaxer {
         state.velocities[0] = Vec2::ZERO;
         state.velocities[payload] = target.velocity;
         project_velocities(state, masses, target.velocity, constraint_sweeps);
+        damp_bending_velocities(config, state, masses, rest_length, target.velocity, dt);
         advance_material_state(config, state, rest_length, dt);
     }
 
@@ -93,6 +97,20 @@ impl XpbdRopeRelaxer {
                         held_payload.is_some(),
                     );
                 }
+                if config.bending_rigidity > 0.0 {
+                    for center in 1..state.node_count().saturating_sub(1) {
+                        project_bending_vertex(
+                            state,
+                            masses,
+                            &mut self.bending_multipliers,
+                            center,
+                            rest_length,
+                            config.bending_rigidity,
+                            dt,
+                            held_payload.is_some(),
+                        );
+                    }
+                }
             } else {
                 for element in (0..config.segment_count).rev() {
                     project_element(
@@ -105,6 +123,20 @@ impl XpbdRopeRelaxer {
                         held_payload.is_some(),
                     );
                 }
+                if config.bending_rigidity > 0.0 {
+                    for center in (1..state.node_count().saturating_sub(1)).rev() {
+                        project_bending_vertex(
+                            state,
+                            masses,
+                            &mut self.bending_multipliers,
+                            center,
+                            rest_length,
+                            config.bending_rigidity,
+                            dt,
+                            held_payload.is_some(),
+                        );
+                    }
+                }
             }
             state.positions[0] = config.anchor;
             if let Some(payload_position) = held_payload {
@@ -116,6 +148,119 @@ impl XpbdRopeRelaxer {
 
     fn resize(&mut self, node_count: usize) {
         self.multipliers.resize(node_count.saturating_sub(1), 0.0);
+        self.bending_multipliers
+            .resize(node_count.saturating_sub(2), 0.0);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_bending_vertex(
+    state: &mut State,
+    masses: &[f64],
+    multipliers: &mut [f64],
+    center: usize,
+    rest_length: f64,
+    bending_rigidity: f64,
+    dt: f64,
+    payload_is_held: bool,
+) {
+    let Some(geometry) = crate::dynamics::bending::geometry(state, center) else {
+        return;
+    };
+    let nodes = [center - 1, center, center + 1];
+    let payload = state.node_count() - 1;
+    let inverse_masses = nodes.map(|node| inverse_mass(masses, node, payload, payload_is_held));
+    let scaled_compliance = rest_length / (bending_rigidity * dt * dt);
+    let denominator = scaled_compliance
+        + inverse_masses
+            .iter()
+            .zip(geometry.gradients)
+            .map(|(inverse_mass, gradient)| inverse_mass * gradient.length_squared())
+            .sum::<f64>();
+    if denominator <= 0.0 || !denominator.is_finite() {
+        return;
+    }
+
+    let multiplier = &mut multipliers[center - 1];
+    let change = (-geometry.angle - scaled_compliance * *multiplier) / denominator;
+    *multiplier += change;
+    for local in 0..3 {
+        state.positions[nodes[local]] +=
+            geometry.gradients[local] * (inverse_masses[local] * change);
+    }
+}
+
+fn damp_bending_velocities(
+    config: &SimulationConfig,
+    state: &mut State,
+    masses: &[f64],
+    rest_length: f64,
+    payload_velocity: Vec2,
+    dt: f64,
+) {
+    if config.bending_viscosity <= 0.0 {
+        return;
+    }
+    let payload = state.node_count() - 1;
+    for reverse in [false, true] {
+        if reverse {
+            for center in (1..state.node_count().saturating_sub(1)).rev() {
+                damp_bending_vertex(
+                    state,
+                    masses,
+                    center,
+                    rest_length,
+                    config.bending_viscosity,
+                    0.5 * dt,
+                    payload,
+                );
+            }
+        } else {
+            for center in 1..state.node_count().saturating_sub(1) {
+                damp_bending_vertex(
+                    state,
+                    masses,
+                    center,
+                    rest_length,
+                    config.bending_viscosity,
+                    0.5 * dt,
+                    payload,
+                );
+            }
+        }
+        state.velocities[0] = Vec2::ZERO;
+        state.velocities[payload] = payload_velocity;
+    }
+}
+
+fn damp_bending_vertex(
+    state: &mut State,
+    masses: &[f64],
+    center: usize,
+    rest_length: f64,
+    bending_viscosity: f64,
+    dt: f64,
+    payload: usize,
+) {
+    let Some(geometry) = crate::dynamics::bending::geometry(state, center) else {
+        return;
+    };
+    let nodes = [center - 1, center, center + 1];
+    let inverse_masses = nodes.map(|node| inverse_mass(masses, node, payload, true));
+    let effective_inverse_mass = inverse_masses
+        .iter()
+        .zip(geometry.gradients)
+        .map(|(inverse_mass, gradient)| inverse_mass * gradient.length_squared())
+        .sum::<f64>();
+    if effective_inverse_mass <= 0.0 {
+        return;
+    }
+    let damping_rate = bending_viscosity * effective_inverse_mass / rest_length;
+    let removed_fraction = 1.0 - (-damping_rate * dt).exp();
+    let impulse = -removed_fraction * geometry.angle_rate / effective_inverse_mass;
+    for local in 0..3 {
+        state.velocities[nodes[local]] +=
+            geometry.gradients[local] * (inverse_masses[local] * impulse);
     }
 }
 

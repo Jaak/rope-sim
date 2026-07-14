@@ -13,3 +13,9 @@ license = "MIT OR Apache-2.0"
 
 [profile.release]
 lto = "thin"
+
+# The simulator's many tiny vector and block-matrix operations are unusually
+# slow without optimization. Keep the eframe application debuggable while
+# making a normal `cargo run` usable at interactive segment counts.
+[profile.dev.package.ropesim-physics]
+opt-level = 2

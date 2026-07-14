@@ -23,8 +23,9 @@ cargo run -p ropesim-physics --example hybrid_benchmark --release
 ```
 
 The benchmark reports mean, median, and p99 step times for hybrid SLS/QKV
-dragging and free backward Euler at 64, 256, 512, and 1,024 links, plus the
-fully converged release-handoff time and bounded-correction fallback counts.
+dragging and free backward Euler at 64, 256, 512, and 1,024 links. It includes
+axial-only and bending-enabled SLS paths, fully converged release-handoff time,
+and bounded-correction fallback counts.
 
 ## Dynamic-rope calibration fixture
 
@@ -39,13 +40,25 @@ It uses an idealized EN 892/UIAA
 environmental damping. The report includes static and maximum dynamic
 elongation plus peak tension at both ends of the distributed rope.
 
+## Experimental bending probe
+
+```powershell
+cargo run -p ropesim-physics --example bending_probe --release
+```
+
+This sensitivity probe compares axial-only behavior with several uncalibrated
+bending-rigidity values during held end shortening at 20 and 64 links. It also
+reports the ideal vertical first-arrest fixture, which should be nearly
+insensitive to bending. Both bending controls default to zero.
+
 The implementation offers mesh-scaled Hooke spring, Kelvin-Voigt, tension-only
 quadratic Kelvin-Voigt, and standard linear solid rope models,
-mass-proportional air damping, and hybrid XPBD/backward-Euler manipulation of
-the payload. The UI offers semi-implicit Euler, classical
-fourth-order Runge-Kutta (RK4), second-order L-stable Rosenbrock ROS2 with a
-linear-time block-tridiagonal solve, and fully converged backward Euler
-integration.
+mass-proportional air damping, optional experimental bending elasticity and
+viscosity, and hybrid XPBD/backward-Euler manipulation of the payload. The UI
+offers semi-implicit Euler, classical fourth-order Runge-Kutta (RK4),
+second-order L-stable Rosenbrock ROS2, TR-BDF2, and fully converged backward
+Euler integration. Implicit bending uses a linear-time block-pentadiagonal
+solve, with sparse LU retained as a safety fallback.
 
 The default scene represents a 12 m Petzl VOLTA GUIDE 9 mm reference rope
 weighing 0.648 kg (54 g/m), with an 80 kg payload. Its standard-linear-solid

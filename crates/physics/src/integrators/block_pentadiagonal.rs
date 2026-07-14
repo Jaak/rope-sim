@@ -7,28 +7,38 @@ pub(crate) type BlockVector = [f64; BLOCK_SIZE];
 const ZERO_BLOCK: Block = [[0.0; BLOCK_SIZE]; BLOCK_SIZE];
 
 #[derive(Clone, Debug)]
-pub(crate) struct BlockTridiagonalMatrix {
+pub(crate) struct BlockPentadiagonalMatrix {
+    pub second_lower: Vec<Block>,
     pub lower: Vec<Block>,
     pub diagonal: Vec<Block>,
     pub upper: Vec<Block>,
+    pub second_upper: Vec<Block>,
 }
 
-impl BlockTridiagonalMatrix {
+impl BlockPentadiagonalMatrix {
     pub fn new(block_count: usize) -> Self {
         Self {
+            second_lower: vec![ZERO_BLOCK; block_count.saturating_sub(2)],
             lower: vec![ZERO_BLOCK; block_count.saturating_sub(1)],
             diagonal: vec![ZERO_BLOCK; block_count],
             upper: vec![ZERO_BLOCK; block_count.saturating_sub(1)],
+            second_upper: vec![ZERO_BLOCK; block_count.saturating_sub(2)],
         }
     }
 
     pub fn resize_and_clear(&mut self, block_count: usize) {
+        self.second_lower
+            .resize(block_count.saturating_sub(2), ZERO_BLOCK);
         self.lower.resize(block_count.saturating_sub(1), ZERO_BLOCK);
         self.diagonal.resize(block_count, ZERO_BLOCK);
         self.upper.resize(block_count.saturating_sub(1), ZERO_BLOCK);
+        self.second_upper
+            .resize(block_count.saturating_sub(2), ZERO_BLOCK);
+        self.second_lower.fill(ZERO_BLOCK);
         self.lower.fill(ZERO_BLOCK);
         self.diagonal.fill(ZERO_BLOCK);
         self.upper.fill(ZERO_BLOCK);
+        self.second_upper.fill(ZERO_BLOCK);
     }
 
     pub fn add_value(
@@ -45,18 +55,24 @@ impl BlockTridiagonalMatrix {
             &mut self.lower[column_block]
         } else if column_block == row_block + 1 {
             &mut self.upper[row_block]
+        } else if row_block == column_block + 2 {
+            &mut self.second_lower[column_block]
+        } else if column_block == row_block + 2 {
+            &mut self.second_upper[row_block]
         } else {
-            panic!("block entry lies outside the tridiagonal band");
+            panic!("block entry lies outside the pentadiagonal band");
         };
         target[row][column] += value;
     }
 
     pub fn shift_and_scale(&mut self, scale: f64) {
         for block in self
-            .lower
+            .second_lower
             .iter_mut()
+            .chain(&mut self.lower)
             .chain(&mut self.diagonal)
             .chain(&mut self.upper)
+            .chain(&mut self.second_upper)
         {
             for row in block {
                 for value in row {
@@ -72,41 +88,72 @@ impl BlockTridiagonalMatrix {
     }
 }
 
-pub(crate) struct BlockThomasSolver {
+pub(crate) struct BlockPentadiagonalSolver {
+    second_lower: Vec<Block>,
     lower: Vec<Block>,
+    working_diagonal: Vec<Block>,
     diagonal: Vec<SmallLu>,
     reduced_upper: Vec<Block>,
+    reduced_second_upper: Vec<Block>,
 }
 
-impl BlockThomasSolver {
+impl BlockPentadiagonalSolver {
     pub fn new(block_count: usize) -> Self {
         Self {
+            second_lower: vec![ZERO_BLOCK; block_count.saturating_sub(2)],
             lower: vec![ZERO_BLOCK; block_count.saturating_sub(1)],
+            working_diagonal: vec![ZERO_BLOCK; block_count],
             diagonal: vec![SmallLu::identity(); block_count],
             reduced_upper: vec![ZERO_BLOCK; block_count.saturating_sub(1)],
+            reduced_second_upper: vec![ZERO_BLOCK; block_count.saturating_sub(2)],
         }
     }
 
-    pub fn factorize(&mut self, matrix: &BlockTridiagonalMatrix) -> Result<(), StepError> {
+    pub fn factorize(&mut self, matrix: &BlockPentadiagonalMatrix) -> Result<(), StepError> {
         let block_count = matrix.diagonal.len();
+        self.second_lower.clone_from(&matrix.second_lower);
         self.lower.clone_from(&matrix.lower);
+        self.working_diagonal.clone_from(&matrix.diagonal);
         self.diagonal.resize(block_count, SmallLu::identity());
-        self.reduced_upper
-            .resize(block_count.saturating_sub(1), ZERO_BLOCK);
+        self.reduced_upper.clone_from(&matrix.upper);
+        self.reduced_second_upper.clone_from(&matrix.second_upper);
 
         for index in 0..block_count {
-            let mut diagonal = matrix.diagonal[index];
-            if index > 0 {
-                subtract_product(
-                    &mut diagonal,
-                    &self.lower[index - 1],
-                    &self.reduced_upper[index - 1],
-                );
-            }
-
-            self.diagonal[index] = SmallLu::factor(diagonal)?;
+            self.diagonal[index] = SmallLu::factor(self.working_diagonal[index])?;
             if index + 1 < block_count {
-                self.reduced_upper[index] = self.diagonal[index].solve_block(matrix.upper[index]);
+                self.reduced_upper[index] =
+                    self.diagonal[index].solve_block(self.reduced_upper[index]);
+            }
+            if index + 2 < block_count {
+                self.reduced_second_upper[index] =
+                    self.diagonal[index].solve_block(self.reduced_second_upper[index]);
+            }
+            if index + 1 < block_count {
+                subtract_product(
+                    &mut self.working_diagonal[index + 1],
+                    &self.lower[index],
+                    &self.reduced_upper[index],
+                );
+                if index + 2 < block_count {
+                    let lower = self.lower[index];
+                    let reduced_second_upper = self.reduced_second_upper[index];
+                    subtract_product(
+                        &mut self.reduced_upper[index + 1],
+                        &lower,
+                        &reduced_second_upper,
+                    );
+                }
+            }
+            if index + 2 < block_count {
+                let second_lower = self.second_lower[index];
+                let reduced_upper = self.reduced_upper[index];
+                let reduced_second_upper = self.reduced_second_upper[index];
+                subtract_product(&mut self.lower[index + 1], &second_lower, &reduced_upper);
+                subtract_product(
+                    &mut self.working_diagonal[index + 2],
+                    &second_lower,
+                    &reduced_second_upper,
+                );
             }
         }
         Ok(())
@@ -121,6 +168,13 @@ impl BlockThomasSolver {
                     right_hand_side[index][component] -= correction[component];
                 }
             }
+            if index > 1 {
+                let correction =
+                    multiply_vector(&self.second_lower[index - 2], right_hand_side[index - 2]);
+                for component in 0..BLOCK_SIZE {
+                    right_hand_side[index][component] -= correction[component];
+                }
+            }
             right_hand_side[index] = self.diagonal[index].solve_vector(right_hand_side[index]);
         }
 
@@ -129,6 +183,15 @@ impl BlockThomasSolver {
                 multiply_vector(&self.reduced_upper[index], right_hand_side[index + 1]);
             for component in 0..BLOCK_SIZE {
                 right_hand_side[index][component] -= correction[component];
+            }
+            if index + 2 < right_hand_side.len() {
+                let correction = multiply_vector(
+                    &self.reduced_second_upper[index],
+                    right_hand_side[index + 2],
+                );
+                for component in 0..BLOCK_SIZE {
+                    right_hand_side[index][component] -= correction[component];
+                }
             }
         }
     }
@@ -247,9 +310,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_thomas_recovers_known_solution() {
+    fn block_pentadiagonal_solver_recovers_known_solution() {
         let block_count = 7;
-        let mut matrix = BlockTridiagonalMatrix::new(block_count);
+        let mut matrix = BlockPentadiagonalMatrix::new(block_count);
         for block in 0..block_count {
             for component in 0..BLOCK_SIZE {
                 matrix.diagonal[block][component][component] = 4.0 + component as f64;
@@ -264,6 +327,12 @@ mod tests {
                     matrix.lower[block][component][component] = -0.25;
                 }
             }
+            if block + 2 < block_count {
+                for component in 0..BLOCK_SIZE {
+                    matrix.second_upper[block][component][component] = 0.03;
+                    matrix.second_lower[block][component][component] = -0.04;
+                }
+            }
         }
 
         let expected: Vec<BlockVector> = (0..block_count)
@@ -272,7 +341,7 @@ mod tests {
             })
             .collect();
         let mut rhs = multiply_matrix(&matrix, &expected);
-        let mut solver = BlockThomasSolver::new(block_count);
+        let mut solver = BlockPentadiagonalSolver::new(block_count);
         solver.factorize(&matrix).unwrap();
         solver.solve_in_place(&mut rhs);
 
@@ -285,14 +354,14 @@ mod tests {
 
     #[test]
     fn singular_diagonal_block_is_reported() {
-        let matrix = BlockTridiagonalMatrix::new(2);
-        let mut solver = BlockThomasSolver::new(2);
+        let matrix = BlockPentadiagonalMatrix::new(2);
+        let mut solver = BlockPentadiagonalSolver::new(2);
         assert_eq!(solver.factorize(&matrix), Err(StepError::SingularJacobian));
     }
 
     #[test]
     fn small_block_factorization_uses_row_pivoting() {
-        let mut matrix = BlockTridiagonalMatrix::new(1);
+        let mut matrix = BlockPentadiagonalMatrix::new(1);
         for component in 0..BLOCK_SIZE {
             matrix.diagonal[0][component][component] = 1.0;
         }
@@ -303,7 +372,7 @@ mod tests {
         let expected = [[2.0, -1.0, 0.5, 3.0, -2.0]];
         let mut rhs = multiply_matrix(&matrix, &expected);
 
-        let mut solver = BlockThomasSolver::new(1);
+        let mut solver = BlockPentadiagonalSolver::new(1);
         solver.factorize(&matrix).unwrap();
         solver.solve_in_place(&mut rhs);
 
@@ -313,7 +382,7 @@ mod tests {
     }
 
     fn multiply_matrix(
-        matrix: &BlockTridiagonalMatrix,
+        matrix: &BlockPentadiagonalMatrix,
         vector: &[BlockVector],
     ) -> Vec<BlockVector> {
         let mut output = vec![[0.0; BLOCK_SIZE]; vector.len()];
@@ -327,6 +396,18 @@ mod tests {
             }
             if index + 1 < vector.len() {
                 let value = multiply_vector(&matrix.upper[index], vector[index + 1]);
+                for component in 0..BLOCK_SIZE {
+                    output[index][component] += value[component];
+                }
+            }
+            if index > 1 {
+                let value = multiply_vector(&matrix.second_lower[index - 2], vector[index - 2]);
+                for component in 0..BLOCK_SIZE {
+                    output[index][component] += value[component];
+                }
+            }
+            if index + 2 < vector.len() {
+                let value = multiply_vector(&matrix.second_upper[index], vector[index + 2]);
                 for component in 0..BLOCK_SIZE {
                     output[index][component] += value[component];
                 }

@@ -8,23 +8,26 @@ const ZERO_MATRIX2: Matrix2 = [[0.0; 2]; 2];
 
 /// Solves the position-only Newton systems produced by the implicit integrators.
 ///
-/// Each dynamic rope node contributes a 2x2 block. Axial elements only couple
-/// neighboring nodes, so the resulting matrix is block tridiagonal even when
-/// either endpoint is prescribed. Factorization and solution are separate so
-/// their costs can be measured and optimized independently.
-pub(super) struct NewtonBlockTridiagonalSolver {
+/// Each dynamic rope node contributes a 2x2 block. Axial forces couple nearest
+/// neighbors and bending forces couple second neighbors, producing a block
+/// pentadiagonal matrix. Banded elimination remains linear in the node count.
+pub(super) struct NewtonBlockPentadiagonalSolver {
+    second_lower: Vec<Matrix2>,
     lower: Vec<Matrix2>,
     diagonal: Vec<Matrix2>,
     reduced_upper: Vec<Matrix2>,
+    reduced_second_upper: Vec<Matrix2>,
     right_hand_side: Vec<Vec2>,
 }
 
-impl NewtonBlockTridiagonalSolver {
+impl NewtonBlockPentadiagonalSolver {
     pub fn new(block_count: usize) -> Self {
         Self {
+            second_lower: vec![ZERO_MATRIX2; block_count.saturating_sub(2)],
             lower: vec![ZERO_MATRIX2; block_count.saturating_sub(1)],
             diagonal: vec![ZERO_MATRIX2; block_count],
             reduced_upper: vec![ZERO_MATRIX2; block_count.saturating_sub(1)],
+            reduced_second_upper: vec![ZERO_MATRIX2; block_count.saturating_sub(2)],
             right_hand_side: vec![Vec2::ZERO; block_count],
         }
     }
@@ -36,15 +39,21 @@ impl NewtonBlockTridiagonalSolver {
         block_count: usize,
         dt: f64,
     ) -> Result<(), StepError> {
+        self.second_lower
+            .resize(block_count.saturating_sub(2), ZERO_MATRIX2);
         self.lower
             .resize(block_count.saturating_sub(1), ZERO_MATRIX2);
         self.diagonal.resize(block_count, ZERO_MATRIX2);
         self.reduced_upper
             .resize(block_count.saturating_sub(1), ZERO_MATRIX2);
+        self.reduced_second_upper
+            .resize(block_count.saturating_sub(2), ZERO_MATRIX2);
         self.right_hand_side.resize(block_count, Vec2::ZERO);
+        self.second_lower.fill(ZERO_MATRIX2);
         self.lower.fill(ZERO_MATRIX2);
         self.diagonal.fill(ZERO_MATRIX2);
         self.reduced_upper.fill(ZERO_MATRIX2);
+        self.reduced_second_upper.fill(ZERO_MATRIX2);
 
         for diagonal in &mut self.diagonal {
             diagonal[0][0] = 1.0;
@@ -67,6 +76,10 @@ impl NewtonBlockTridiagonalSolver {
                 &mut self.lower[column_block]
             } else if column_block == row_block + 1 {
                 &mut self.reduced_upper[row_block]
+            } else if row_block == column_block + 2 {
+                &mut self.second_lower[column_block]
+            } else if column_block == row_block + 2 {
+                &mut self.reduced_second_upper[row_block]
             } else {
                 return Err(StepError::SingularJacobian);
             };
@@ -79,20 +92,43 @@ impl NewtonBlockTridiagonalSolver {
             }
         }
 
-        // reduced_upper initially stores the original upper blocks. It is
-        // overwritten in place with D_i^-1 U_i during factorization.
+        // The upper arrays initially store the assembled bands. Each pivot row
+        // is normalized in place; the two following rows are then reduced.
         for index in 0..block_count {
-            if index > 0 {
-                self.diagonal[index] = subtract_matrix_product(
-                    self.diagonal[index],
-                    self.lower[index - 1],
-                    self.reduced_upper[index - 1],
-                );
-            }
             ensure_invertible(self.diagonal[index])?;
             if index + 1 < block_count {
                 self.reduced_upper[index] =
                     solve_matrix2_columns(self.diagonal[index], self.reduced_upper[index])?;
+            }
+            if index + 2 < block_count {
+                self.reduced_second_upper[index] =
+                    solve_matrix2_columns(self.diagonal[index], self.reduced_second_upper[index])?;
+            }
+            if index + 1 < block_count {
+                self.diagonal[index + 1] = subtract_matrix_product(
+                    self.diagonal[index + 1],
+                    self.lower[index],
+                    self.reduced_upper[index],
+                );
+                if index + 2 < block_count {
+                    self.reduced_upper[index + 1] = subtract_matrix_product(
+                        self.reduced_upper[index + 1],
+                        self.lower[index],
+                        self.reduced_second_upper[index],
+                    );
+                }
+            }
+            if index + 2 < block_count {
+                self.lower[index + 1] = subtract_matrix_product(
+                    self.lower[index + 1],
+                    self.second_lower[index],
+                    self.reduced_upper[index],
+                );
+                self.diagonal[index + 2] = subtract_matrix_product(
+                    self.diagonal[index + 2],
+                    self.second_lower[index],
+                    self.reduced_second_upper[index],
+                );
             }
         }
         Ok(())
@@ -111,6 +147,11 @@ impl NewtonBlockTridiagonalSolver {
                 self.right_hand_side[index] -=
                     multiply_matrix_vector(self.lower[index - 1], previous);
             }
+            if index > 1 {
+                let previous = self.right_hand_side[index - 2];
+                self.right_hand_side[index] -=
+                    multiply_matrix_vector(self.second_lower[index - 2], previous);
+            }
             self.right_hand_side[index] =
                 solve_matrix2(self.diagonal[index], self.right_hand_side[index])?;
         }
@@ -118,6 +159,11 @@ impl NewtonBlockTridiagonalSolver {
         for index in (0..block_count.saturating_sub(1)).rev() {
             let next = self.right_hand_side[index + 1];
             self.right_hand_side[index] -= multiply_matrix_vector(self.reduced_upper[index], next);
+            if index + 2 < block_count {
+                let second_next = self.right_hand_side[index + 2];
+                self.right_hand_side[index] -=
+                    multiply_matrix_vector(self.reduced_second_upper[index], second_next);
+            }
         }
         for (block, solution) in self.right_hand_side.iter().enumerate() {
             output[2 * block] = solution.x;
@@ -184,6 +230,8 @@ mod tests {
         let diagonal = [[4.0, 0.2], [-0.1, 3.0]];
         let lower = [[-0.4, 0.1], [0.05, -0.3]];
         let upper = [[-0.2, -0.05], [0.1, -0.25]];
+        let second_lower = [[0.07, -0.02], [0.03, 0.04]];
+        let second_upper = [[-0.06, 0.01], [-0.02, 0.05]];
         let expected = [
             Vec2::new(0.5, -0.25),
             Vec2::new(1.0, 0.75),
@@ -197,6 +245,12 @@ mod tests {
             }
             if row + 1 < expected.len() {
                 value += multiply_matrix_vector(upper, expected[row + 1]);
+            }
+            if row > 1 {
+                value += multiply_matrix_vector(second_lower, expected[row - 2]);
+            }
+            if row + 2 < expected.len() {
+                value += multiply_matrix_vector(second_upper, expected[row + 2]);
             }
             residual[2 * row] = -value.x;
             residual[2 * row + 1] = -value.y;
@@ -225,11 +279,25 @@ mod tests {
                     velocity: ZERO_MATRIX2,
                 });
             }
+            if node + 2 < expected.len() {
+                acceleration_blocks.push(AccelerationJacobianBlock {
+                    row_node: node,
+                    column_node: node + 2,
+                    position: negate_matrix(second_upper),
+                    velocity: ZERO_MATRIX2,
+                });
+                acceleration_blocks.push(AccelerationJacobianBlock {
+                    row_node: node + 2,
+                    column_node: node,
+                    position: negate_matrix(second_lower),
+                    velocity: ZERO_MATRIX2,
+                });
+            }
         }
 
         let node_to_unknown = [0, 2, 4];
         let mut actual = vec![0.0; 2 * expected.len()];
-        let mut solver = NewtonBlockTridiagonalSolver::new(expected.len());
+        let mut solver = NewtonBlockPentadiagonalSolver::new(expected.len());
         solver
             .factorize(&acceleration_blocks, &node_to_unknown, expected.len(), 1.0)
             .unwrap();

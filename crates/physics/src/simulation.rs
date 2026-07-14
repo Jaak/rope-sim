@@ -20,12 +20,14 @@ pub struct Diagnostics {
     pub kinetic_energy: f64,
     pub gravitational_energy: f64,
     pub elastic_energy: f64,
+    pub bending_energy: f64,
     pub total_mechanical_energy: f64,
     pub maximum_absolute_strain: f64,
     pub maximum_tensile_strain: f64,
     pub minimum_segment_length: f64,
     pub maximum_segment_length: f64,
     pub maximum_node_speed: f64,
+    pub maximum_curvature: f64,
     pub prescribed_endpoint_power: f64,
     pub cumulative_prescribed_work: f64,
     pub rejected_steps: u64,
@@ -468,11 +470,13 @@ impl Simulation {
         let mut kinetic_energy = 0.0;
         let mut gravitational_energy = 0.0;
         let mut elastic_energy = 0.0;
+        let mut bending_energy = 0.0;
         let mut maximum_absolute_strain: f64 = 0.0;
         let mut maximum_tensile_strain: f64 = 0.0;
         let mut minimum_segment_length = f64::INFINITY;
         let mut maximum_segment_length: f64 = 0.0;
         let mut maximum_node_speed: f64 = 0.0;
+        let mut maximum_curvature: f64 = 0.0;
 
         for index in 0..self.state.node_count() {
             kinetic_energy +=
@@ -502,6 +506,18 @@ impl Simulation {
                 maximum_tensile_strain.max((extension / self.rest_length).max(0.0));
         }
 
+        for center in 1..self.state.node_count().saturating_sub(1) {
+            if let Some(geometry) = crate::dynamics::bending::geometry(&self.state, center) {
+                if self.config.bending_rigidity > 0.0 {
+                    bending_energy +=
+                        0.5 * self.config.bending_rigidity * geometry.angle * geometry.angle
+                            / self.rest_length;
+                }
+                maximum_curvature = maximum_curvature.max(geometry.angle.abs() / self.rest_length);
+            }
+        }
+        elastic_energy += bending_energy;
+
         let system = RopeDynamics::new(
             &self.config,
             &self.masses,
@@ -517,12 +533,14 @@ impl Simulation {
             kinetic_energy,
             gravitational_energy,
             elastic_energy,
+            bending_energy,
             total_mechanical_energy: kinetic_energy + gravitational_energy + elastic_energy,
             maximum_absolute_strain,
             maximum_tensile_strain,
             minimum_segment_length,
             maximum_segment_length,
             maximum_node_speed,
+            maximum_curvature,
             prescribed_endpoint_power: self.prescribed_endpoint_power(),
             cumulative_prescribed_work: self.cumulative_prescribed_work,
             rejected_steps: statistics.rejected_steps,
@@ -555,7 +573,21 @@ impl Simulation {
         }
         let direction = delta / length;
         let tension = self.segment_tension(left).unwrap_or(0.0);
-        (direction * tension).dot(target.velocity)
+        let mut prescribed_force = direction * tension;
+        if (self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0)
+            && let Some(forces) = crate::dynamics::bending::forces(
+                &self.state,
+                left,
+                self.rest_length,
+                self.config.bending_rigidity,
+                self.config.bending_viscosity,
+            )
+        {
+            // The prescribed endpoint supplies the reaction opposite to the
+            // internal bending force on the payload.
+            prescribed_force -= forces[2];
+        }
+        prescribed_force.dot(target.velocity)
     }
 
     fn payload_index(&self) -> usize {

@@ -1,6 +1,6 @@
 mod backward_euler;
-pub(crate) mod block_tridiagonal;
-mod newton_block_tridiagonal;
+pub(crate) mod block_pentadiagonal;
+mod newton_block_pentadiagonal;
 mod rk4;
 mod rosenbrock;
 mod semi_implicit_euler;
@@ -12,7 +12,7 @@ use std::fmt;
 use crate::math::Vec2;
 use crate::state::State;
 
-use block_tridiagonal::BlockTridiagonalMatrix;
+use block_pentadiagonal::BlockPentadiagonalMatrix;
 
 pub(crate) use backward_euler::{BackwardEuler, PredictorCorrection};
 use rk4::RungeKutta4;
@@ -40,7 +40,7 @@ pub(crate) trait DynamicalSystem {
 
     /// Assemble the Jacobian of the complete first-order state derivative in
     /// node/element blocks for linearly implicit integration.
-    fn first_order_jacobian(&self, state: &State, output: &mut BlockTridiagonalMatrix);
+    fn first_order_jacobian(&self, state: &State, output: &mut BlockPentadiagonalMatrix);
 
     /// Update constitutive state consistently with a backward-Euler trial.
     fn prepare_implicit_state(&self, initial: &State, trial: &mut State, dt: f64);

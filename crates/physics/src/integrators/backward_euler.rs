@@ -6,7 +6,7 @@ use faer::sparse::{SparseColMat, Triplet};
 use crate::math::Vec2;
 use crate::state::State;
 
-use super::newton_block_tridiagonal::NewtonBlockTridiagonalSolver;
+use super::newton_block_pentadiagonal::NewtonBlockPentadiagonalSolver;
 use super::{
     AccelerationJacobianBlock, DynamicalSystem, IntegratorStatistics, StepError, TimeIntegrator,
     validate_timestep,
@@ -34,7 +34,7 @@ pub(crate) struct BackwardEuler {
     jacobian_triplets: Vec<Triplet<usize, usize, f64>>,
     jacobian_matrix: Option<SparseColMat<usize, f64>>,
     symbolic_lu: Option<SymbolicLu<usize>>,
-    block_solver: NewtonBlockTridiagonalSolver,
+    block_solver: NewtonBlockPentadiagonalSolver,
     delta: Vec<f64>,
     base_unknowns: Vec<f64>,
     statistics: IntegratorStatistics,
@@ -64,7 +64,7 @@ impl BackwardEuler {
             jacobian_triplets: Vec::with_capacity(20 * node_count),
             jacobian_matrix: None,
             symbolic_lu: None,
-            block_solver: NewtonBlockTridiagonalSolver::new(node_count),
+            block_solver: NewtonBlockPentadiagonalSolver::new(node_count),
             delta: Vec::new(),
             base_unknowns: Vec::new(),
             statistics: IntegratorStatistics::default(),

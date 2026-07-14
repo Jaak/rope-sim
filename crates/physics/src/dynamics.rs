@@ -1,7 +1,8 @@
+pub(crate) mod bending;
 mod element;
 
 use crate::config::SimulationConfig;
-use crate::integrators::block_tridiagonal::BlockTridiagonalMatrix;
+use crate::integrators::block_pentadiagonal::BlockPentadiagonalMatrix;
 use crate::integrators::{AccelerationJacobianBlock, DynamicalSystem};
 use crate::kinematics::{KinematicMotion, KinematicTarget};
 use crate::materials::{AxialKinematics, AxialMaterial, AxialResponse};
@@ -122,6 +123,36 @@ impl<'a> RopeDynamics<'a> {
                 );
             }
         }
+
+        if self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0 {
+            for center in 1..state.node_count().saturating_sub(1) {
+                let Some(response) = bending::response(
+                    state,
+                    center,
+                    self.rest_length,
+                    self.config.bending_rigidity,
+                    self.config.bending_viscosity,
+                ) else {
+                    continue;
+                };
+                let nodes = [center - 1, center, center + 1];
+                for (local_row, &row_node) in nodes.iter().enumerate() {
+                    if !self.is_dynamic_node(row_node) {
+                        continue;
+                    }
+                    for (local_column, &column_node) in nodes.iter().enumerate() {
+                        push_element_jacobian_row(
+                            output,
+                            row_node,
+                            column_node,
+                            response.position_jacobian[local_row][local_column],
+                            response.velocity_jacobian[local_row][local_column],
+                            1.0 / self.masses[row_node],
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -161,6 +192,26 @@ impl DynamicalSystem for RopeDynamics<'_> {
                 output[right] -= force / self.masses[right];
             }
         }
+
+        if self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0 {
+            for center in 1..state.node_count().saturating_sub(1) {
+                let Some(forces) = bending::forces(
+                    state,
+                    center,
+                    self.rest_length,
+                    self.config.bending_rigidity,
+                    self.config.bending_viscosity,
+                ) else {
+                    continue;
+                };
+                let nodes = [center - 1, center, center + 1];
+                for (local, &node) in nodes.iter().enumerate() {
+                    if self.is_dynamic_node(node) {
+                        output[node] += forces[local] / self.masses[node];
+                    }
+                }
+            }
+        }
     }
 
     fn material_state_derivatives(&self, state: &State, output: &mut [f64]) {
@@ -182,7 +233,7 @@ impl DynamicalSystem for RopeDynamics<'_> {
         }
     }
 
-    fn first_order_jacobian(&self, state: &State, output: &mut BlockTridiagonalMatrix) {
+    fn first_order_jacobian(&self, state: &State, output: &mut BlockPentadiagonalMatrix) {
         output.resize_and_clear(state.node_count());
 
         for node in 0..state.node_count() {
@@ -318,6 +369,36 @@ impl DynamicalSystem for RopeDynamics<'_> {
                 );
             }
         }
+
+        if self.config.bending_rigidity > 0.0 || self.config.bending_viscosity > 0.0 {
+            for center in 1..state.node_count().saturating_sub(1) {
+                let Some(response) = bending::response(
+                    state,
+                    center,
+                    self.rest_length,
+                    self.config.bending_rigidity,
+                    self.config.bending_viscosity,
+                ) else {
+                    continue;
+                };
+                let nodes = [center - 1, center, center + 1];
+                for (local_row, &row_node) in nodes.iter().enumerate() {
+                    if !self.is_dynamic_node(row_node) {
+                        continue;
+                    }
+                    for (local_column, &column_node) in nodes.iter().enumerate() {
+                        add_force_jacobian_row(
+                            output,
+                            row_node,
+                            column_node,
+                            response.position_jacobian[local_row][local_column],
+                            response.velocity_jacobian[local_row][local_column],
+                            1.0 / self.masses[row_node],
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn prepare_implicit_state(&self, initial: &State, trial: &mut State, dt: f64) {
@@ -375,8 +456,10 @@ impl DynamicalSystem for RopeDynamics<'_> {
         let spring_limited_dt = self.elastic_stable_timestep(state);
 
         let element_damping = self.material.explicit_viscosity() / self.rest_length;
-        let maximum_damping_rate =
-            self.config.air_damping_rate + 4.0 * element_damping / minimum_dynamic_mass;
+        let maximum_damping_rate = self.config.air_damping_rate
+            + 4.0 * element_damping / minimum_dynamic_mass
+            + 16.0 * self.config.bending_viscosity
+                / (minimum_dynamic_mass * self.rest_length.powi(3));
         let damping_limited_dt = if maximum_damping_rate > 0.0 {
             0.5 / maximum_damping_rate
         } else {
@@ -414,7 +497,14 @@ impl DynamicalSystem for RopeDynamics<'_> {
             })
             .fold(0.0_f64, f64::max);
         let element_stiffness = maximum_tangent_rigidity / self.rest_length;
-        0.8 * (minimum_dynamic_mass / element_stiffness).sqrt()
+        let axial_limit = 0.8 * (minimum_dynamic_mass / element_stiffness).sqrt();
+        let bending_limit = if self.config.bending_rigidity > 0.0 {
+            0.2 * (minimum_dynamic_mass * self.rest_length.powi(3) / self.config.bending_rigidity)
+                .sqrt()
+        } else {
+            f64::INFINITY
+        };
+        axial_limit.min(bending_limit)
     }
 
     fn has_kinematic_target(&self) -> bool {
@@ -448,7 +538,7 @@ fn push_element_jacobian_row(
 }
 
 fn add_force_jacobian_row(
-    output: &mut BlockTridiagonalMatrix,
+    output: &mut BlockPentadiagonalMatrix,
     row_node: usize,
     column_node: usize,
     force_position_jacobian: [[f64; 2]; 2],
@@ -495,6 +585,8 @@ mod tests {
             segment_count: 3,
             rope_model,
             axial_viscosity: 7.0,
+            bending_rigidity: 0.2,
+            bending_viscosity: 0.03,
             ..SimulationConfig::default()
         };
         let rest_length = config.rope_length / config.segment_count as f64;
@@ -570,6 +662,8 @@ mod tests {
             rope_model: RopeModelKind::StandardLinearSolid,
             axial_viscosity: 900.0,
             transient_axial_rigidity: 18_000.0,
+            bending_rigidity: 0.2,
+            bending_viscosity: 0.03,
             ..SimulationConfig::default()
         };
         let rest_length = config.rope_length / config.segment_count as f64;
@@ -652,6 +746,8 @@ mod tests {
             rope_model: RopeModelKind::StandardLinearSolid,
             axial_viscosity: 900.0,
             transient_axial_rigidity: 18_000.0,
+            bending_rigidity: 0.2,
+            bending_viscosity: 0.03,
             ..SimulationConfig::default()
         };
         let rest_length = config.rope_length / config.segment_count as f64;
@@ -666,7 +762,7 @@ mod tests {
         state.material_state = vec![120.0, -35.0, 80.0];
 
         let system = RopeDynamics::new(&config, &masses, rest_length, None, None, 0.0);
-        let mut jacobian = BlockTridiagonalMatrix::new(state.node_count());
+        let mut jacobian = BlockPentadiagonalMatrix::new(state.node_count());
         system.first_order_jacobian(&state, &mut jacobian);
 
         for column_node in 0..state.node_count() {
@@ -763,7 +859,7 @@ mod tests {
     }
 
     fn block_value(
-        matrix: &BlockTridiagonalMatrix,
+        matrix: &BlockPentadiagonalMatrix,
         row_block: usize,
         column_block: usize,
         row: usize,
@@ -775,6 +871,10 @@ mod tests {
             matrix.lower[column_block][row][column]
         } else if column_block == row_block + 1 {
             matrix.upper[row_block][row][column]
+        } else if row_block == column_block + 2 {
+            matrix.second_lower[column_block][row][column]
+        } else if column_block == row_block + 2 {
+            matrix.second_upper[row_block][row][column]
         } else {
             0.0
         }

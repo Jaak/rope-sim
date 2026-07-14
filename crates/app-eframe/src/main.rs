@@ -227,6 +227,42 @@ impl RopeSimApp {
                                 self.config.axial_viscosity / self.config.transient_axial_rigidity
                             ));
                         }
+                        let mut bending_enabled = self.config.bending_rigidity > 0.0
+                            || self.config.bending_viscosity > 0.0;
+                        if ui
+                            .checkbox(&mut bending_enabled, "Experimental bending")
+                            .on_hover_text(
+                                "Adds mesh-scaled resistance to curvature. Disable to recover the axial-only model.",
+                            )
+                            .changed()
+                        {
+                            if bending_enabled {
+                                self.config.bending_rigidity = 0.01;
+                                self.config.bending_viscosity = 0.001;
+                            } else {
+                                self.config.bending_rigidity = 0.0;
+                                self.config.bending_viscosity = 0.0;
+                            }
+                        }
+                        if bending_enabled {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.config.bending_rigidity,
+                                    1.0e-6..=10.0,
+                                )
+                                .logarithmic(true)
+                                .text("Bending rigidity B (N*m^2)"),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.config.bending_viscosity,
+                                    1.0e-7..=1.0,
+                                )
+                                .logarithmic(true)
+                                .text("Bending viscosity (N*m^2*s)"),
+                            );
+                            ui.small("Experimental; no calibrated 9 mm reference is available.");
+                        }
                         ui.add(
                             egui::Slider::new(&mut self.config.air_damping_rate, 0.0..=5.0)
                                 .text("Air damping (1/s)"),
@@ -401,6 +437,12 @@ impl RopeSimApp {
                                         );
                                         diagnostic_row(
                                             ui,
+                                            "Bending",
+                                            self.diagnostics.bending_energy,
+                                            "J",
+                                        );
+                                        diagnostic_row(
+                                            ui,
                                             "Gravity",
                                             self.diagnostics.gravitational_energy,
                                             "J",
@@ -428,6 +470,12 @@ impl RopeSimApp {
                                             "Max speed",
                                             self.diagnostics.maximum_node_speed,
                                             "m/s",
+                                        );
+                                        diagnostic_row(
+                                            ui,
+                                            "Max curvature",
+                                            self.diagnostics.maximum_curvature,
+                                            "1/m",
                                         );
                                         diagnostic_row(
                                             ui,
