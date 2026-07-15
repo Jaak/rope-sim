@@ -2,7 +2,6 @@
 members = [
     "crates/physics",
     "crates/app-eframe",
-    "crates/solver-spike",
 ]
 resolver = "3"
 
