@@ -207,6 +207,15 @@ fn replay_scenario(
             integrator.display_name()
         ));
     }
+    if path.file_stem().and_then(|name| name.to_str()) == Some("bug-10")
+        && maximum_node_speed >= 45.0
+    {
+        return Err(format!(
+            "{} amplified its upward flick to {maximum_node_speed:.3} m/s at node {maximum_speed_node}, t={maximum_speed_time:.3} with {}",
+            path.display(),
+            integrator.display_name()
+        ));
+    }
     if let Some(speed) = settling_probe_speed
         && speed >= 2.0
     {

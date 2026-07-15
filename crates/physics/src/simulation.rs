@@ -10,7 +10,7 @@ use crate::math::Vec2;
 use crate::state::State;
 use crate::xpbd::XpbdRopeRelaxer;
 
-const MAXIMUM_MANIPULATION_THROW_SPEED: f64 = 20.0;
+const MAXIMUM_MANIPULATION_SPEED: f64 = 30.0;
 const MANIPULATION_CORRECTION_INTERVAL: f64 = 1.0 / 120.0;
 const MANIPULATION_NEWTON_BUDGET: usize = 4;
 
@@ -307,10 +307,11 @@ impl Simulation {
         self.state.velocities[index] = velocity;
     }
 
-    /// Move the payload directly while relaxing the rope with XPBD.
+    /// Move the payload toward the cursor while relaxing the rope with XPBD.
     ///
-    /// The position is exact while the supplied velocity is retained for a
-    /// continuous, throwable handoff to the selected physical integrator.
+    /// Ordinary cursor motion is exact. Extreme input jumps are rate-limited
+    /// together with the supplied velocity so position and velocity describe
+    /// a consistent, throwable boundary trajectory.
     pub fn set_manipulation_target(&mut self, target: KinematicTarget) {
         self.payload_motion = None;
         self.payload_target = None;
@@ -320,7 +321,7 @@ impl Simulation {
         }
         let target = KinematicTarget::new(
             target.position,
-            limit_magnitude(target.velocity, MAXIMUM_MANIPULATION_THROW_SPEED),
+            limit_magnitude(target.velocity, MAXIMUM_MANIPULATION_SPEED),
         );
         self.manipulation_target = Some(target);
         let payload = self.payload_index();
@@ -331,7 +332,7 @@ impl Simulation {
     /// integrator, preserving internal motion and applying the throw velocity.
     pub fn release_manipulation(&mut self, velocity: Vec2) {
         let velocity = self.manipulation_target.map_or_else(
-            || limit_magnitude(velocity, MAXIMUM_MANIPULATION_THROW_SPEED),
+            || limit_magnitude(velocity, MAXIMUM_MANIPULATION_SPEED),
             |target| target.velocity,
         );
         self.finish_manipulation_handoff();
@@ -358,6 +359,14 @@ impl Simulation {
         if let Some(target) = self.manipulation_target {
             let start_target =
                 KinematicTarget::new(self.payload_position(), self.payload_velocity());
+            let target = KinematicTarget::new(
+                start_target.position
+                    + limit_magnitude(
+                        target.position - start_target.position,
+                        MAXIMUM_MANIPULATION_SPEED * dt,
+                    ),
+                target.velocity,
+            );
             self.interaction_initial.clone_from(&self.state);
             self.manipulation_relaxer.step_held(
                 &self.config,

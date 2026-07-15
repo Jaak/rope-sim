@@ -265,6 +265,23 @@ fn xpbd_manipulation_pins_the_payload_and_preserves_boundary_velocity() {
 }
 
 #[test]
+fn xpbd_manipulation_rate_limits_extreme_cursor_motion_and_velocity_together() {
+    const MAXIMUM_SPEED: f64 = 30.0;
+    let dt = 1.0 / 240.0;
+    let mut simulation = Simulation::new(SimulationConfig::default()).unwrap();
+    let start = simulation.payload_position();
+    simulation.set_manipulation_target(KinematicTarget::new(
+        start + Vec2::new(100.0, 0.0),
+        Vec2::new(100.0, 0.0),
+    ));
+
+    simulation.step(dt).unwrap();
+
+    assert!((simulation.payload_position() - start).length() <= MAXIMUM_SPEED * dt + 1.0e-12);
+    assert!((simulation.payload_velocity().length() - MAXIMUM_SPEED).abs() < 1.0e-12);
+}
+
+#[test]
 fn xpbd_release_immediately_hands_throw_velocity_to_the_selected_integrator() {
     let mut simulation = Simulation::new(SimulationConfig {
         segment_count: 1,
@@ -514,9 +531,11 @@ fn xpbd_manipulation_represents_quadratic_kelvin_voigt_slack_with_folds() {
     }
 
     assert_eq!(simulation.payload_position(), target.position);
+    let minimum_length = simulation.diagnostics().minimum_segment_length;
+    let rest_length = simulation.rest_length();
     assert!(
-        (simulation.diagnostics().minimum_segment_length - simulation.rest_length()).abs()
-            < 0.02 * simulation.rest_length()
+        (minimum_length - rest_length).abs() < 0.02 * rest_length,
+        "minimum element length {minimum_length:.6} differed from rest length {rest_length:.6}"
     );
 }
 

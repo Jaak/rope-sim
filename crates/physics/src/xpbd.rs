@@ -42,6 +42,7 @@ impl XpbdRopeRelaxer {
         }
         state.positions[0] = config.anchor;
         state.positions[payload] = target.position;
+        seed_compressive_buckling(state, rest_length);
 
         self.project_constraints(
             config,
@@ -57,8 +58,13 @@ impl XpbdRopeRelaxer {
         // velocities instead, so the held constraints can support gravity.
         state.velocities[0] = Vec2::ZERO;
         state.velocities[payload] = target.velocity;
-        self.global_projection
-            .project_velocities(state, masses, target.velocity);
+        let scaled_axial_compliance = rest_length / (config.axial_rigidity * dt * dt);
+        self.global_projection.project_velocities(
+            state,
+            masses,
+            target.velocity,
+            scaled_axial_compliance,
+        );
         damp_bending_velocities(config, state, masses, rest_length, target.velocity, dt);
         advance_material_state(config, state, rest_length, dt);
     }
@@ -99,6 +105,54 @@ impl XpbdRopeRelaxer {
 
     fn resize(&mut self, node_count: usize) {
         self.global_projection.resize(node_count.saturating_sub(1));
+    }
+}
+
+/// Break the exact straight-chain symmetry when held endpoints move closer
+/// than the rope's material length.
+///
+/// A compressed axial chain with no lateral displacement has a valid but
+/// unstable discrete equilibrium. Depending on roundoff to choose a buckling
+/// direction made interaction behavior resolution- and solver-dependent. This
+/// tiny first-mode imperfection is visually negligible and gives the global
+/// projection a deterministic direction in which to represent slack.
+fn seed_compressive_buckling(state: &mut State, rest_length: f64) {
+    let payload = state.node_count().saturating_sub(1);
+    if payload < 2 {
+        return;
+    }
+    let chord = state.positions[payload] - state.positions[0];
+    let chord_length = chord.length();
+    let material_length = rest_length * payload as f64;
+    if chord_length >= material_length || chord_length <= f64::EPSILON {
+        return;
+    }
+
+    let direction = chord / chord_length;
+    let perpendicular = Vec2::new(-direction.y, direction.x);
+    let maximum_deviation = state.positions[1..payload]
+        .iter()
+        .enumerate()
+        .map(|(local, position)| {
+            let fraction = (local + 1) as f64 / payload as f64;
+            perpendicular.dot(*position - (state.positions[0] + chord * fraction))
+        })
+        .fold(0.0_f64, |maximum, deviation| maximum.max(deviation.abs()));
+    let seed_amplitude = 1.0e-3 * material_length;
+    if maximum_deviation >= seed_amplitude {
+        return;
+    }
+
+    let middle = payload / 2;
+    let middle_fraction = middle as f64 / payload as f64;
+    let middle_deviation =
+        perpendicular.dot(state.positions[middle] - (state.positions[0] + chord * middle_fraction));
+    let sign = if middle_deviation < 0.0 { -1.0 } else { 1.0 };
+    let added_amplitude = seed_amplitude - maximum_deviation;
+    for node in 1..payload {
+        let fraction = node as f64 / payload as f64;
+        state.positions[node] +=
+            perpendicular * (sign * added_amplitude * (std::f64::consts::PI * fraction).sin());
     }
 }
 
@@ -272,10 +326,18 @@ impl GlobalProjection {
 
     /// Project free velocities onto the axial velocity constraints.
     ///
-    /// A tiny diagonal regularization selects a stable impulse when a perfectly
-    /// straight rope makes the endpoint-held constraint system rank deficient;
-    /// it has negligible effect on velocities.
-    fn project_velocities(&mut self, state: &mut State, masses: &[f64], payload_velocity: Vec2) {
+    /// The material's finite compliance prevents the interaction aid from
+    /// treating a stretchable rope as exactly inextensible. It also regularizes
+    /// nearly straight endpoint-held configurations, where an exact constraint
+    /// solve can amplify a fast boundary velocity enormously. A tiny numerical
+    /// floor remains for a hypothetical zero-compliance caller.
+    fn project_velocities(
+        &mut self,
+        state: &mut State,
+        masses: &[f64],
+        payload_velocity: Vec2,
+        scaled_compliance: f64,
+    ) {
         let element_count = state.node_count().saturating_sub(1);
         if element_count == 0 {
             return;
@@ -308,7 +370,7 @@ impl GlobalProjection {
             }
         }
 
-        let regularization = maximum_diagonal.max(1.0) * 1.0e-12;
+        let regularization = scaled_compliance + maximum_diagonal.max(1.0) * 1.0e-12;
         for diagonal in &mut self.diagonal {
             *diagonal += regularization;
         }
@@ -626,7 +688,7 @@ mod tests {
             let masses = vec![1.0; state.node_count()];
             let mut projection = GlobalProjection::new(state.node_count() - 1);
 
-            projection.project_velocities(&mut state, &masses, Vec2::ZERO);
+            projection.project_velocities(&mut state, &masses, Vec2::ZERO, 0.0);
 
             for element in 0..state.node_count() - 1 {
                 let delta = state.positions[element + 1] - state.positions[element];
