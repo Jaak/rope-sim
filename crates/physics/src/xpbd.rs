@@ -11,17 +11,13 @@ const MINIMUM_MANIPULATION_DAMPING_RATE: f64 = 0.5;
 ///
 /// This is an interaction aid, not a selectable constitutive time integrator.
 pub(crate) struct XpbdRopeRelaxer {
-    multipliers: Vec<f64>,
-    bending_multipliers: Vec<f64>,
-    velocity_projection: VelocityProjection,
+    global_projection: GlobalProjection,
 }
 
 impl XpbdRopeRelaxer {
     pub(crate) fn new(node_count: usize) -> Self {
         Self {
-            multipliers: vec![0.0; node_count.saturating_sub(1)],
-            bending_multipliers: vec![0.0; node_count.saturating_sub(2)],
-            velocity_projection: VelocityProjection::new(node_count.saturating_sub(1)),
+            global_projection: GlobalProjection::new(node_count.saturating_sub(1)),
         }
     }
 
@@ -36,7 +32,6 @@ impl XpbdRopeRelaxer {
     ) {
         self.resize(state.node_count());
         let payload = state.node_count() - 1;
-        let constraint_sweeps = config.segment_count.clamp(CONSTRAINT_SWEEPS, 64);
         let damping_rate = config
             .air_damping_rate
             .max(MINIMUM_MANIPULATION_DAMPING_RATE);
@@ -48,8 +43,6 @@ impl XpbdRopeRelaxer {
         state.positions[0] = config.anchor;
         state.positions[payload] = target.position;
 
-        self.multipliers.fill(0.0);
-        self.bending_multipliers.fill(0.0);
         self.project_constraints(
             config,
             state,
@@ -57,7 +50,6 @@ impl XpbdRopeRelaxer {
             rest_length,
             dt,
             Some(target.position),
-            constraint_sweeps,
         );
 
         // Position corrections include cursor-driven reshaping and must not be
@@ -65,8 +57,8 @@ impl XpbdRopeRelaxer {
         // velocities instead, so the held constraints can support gravity.
         state.velocities[0] = Vec2::ZERO;
         state.velocities[payload] = target.velocity;
-        self.velocity_projection
-            .project(state, masses, target.velocity);
+        self.global_projection
+            .project_velocities(state, masses, target.velocity);
         damp_bending_velocities(config, state, masses, rest_length, target.velocity, dt);
         advance_material_state(config, state, rest_length, dt);
     }
@@ -80,67 +72,23 @@ impl XpbdRopeRelaxer {
         rest_length: f64,
         dt: f64,
         held_payload: Option<Vec2>,
-        constraint_sweeps: usize,
     ) {
         let compliance = rest_length / config.axial_rigidity;
         let scaled_compliance = compliance / (dt * dt);
+        let bending_weight = config.bending_rigidity * dt * dt / rest_length.powi(3);
         // Even a tension-only material retains its geometric material length
         // while held; slack is represented by folds rather than zero-length
         // elements. Its physical constitutive response remains unilateral.
-        for sweep in 0..constraint_sweeps {
-            if sweep % 2 == 0 {
-                for element in 0..config.segment_count {
-                    project_element(
-                        state,
-                        masses,
-                        &mut self.multipliers,
-                        element,
-                        rest_length,
-                        scaled_compliance,
-                        held_payload.is_some(),
-                    );
-                }
-                if config.bending_rigidity > 0.0 {
-                    for center in 1..state.node_count().saturating_sub(1) {
-                        project_bending_vertex(
-                            state,
-                            masses,
-                            &mut self.bending_multipliers,
-                            center,
-                            rest_length,
-                            config.bending_rigidity,
-                            dt,
-                            held_payload.is_some(),
-                        );
-                    }
-                }
-            } else {
-                for element in (0..config.segment_count).rev() {
-                    project_element(
-                        state,
-                        masses,
-                        &mut self.multipliers,
-                        element,
-                        rest_length,
-                        scaled_compliance,
-                        held_payload.is_some(),
-                    );
-                }
-                if config.bending_rigidity > 0.0 {
-                    for center in (1..state.node_count().saturating_sub(1)).rev() {
-                        project_bending_vertex(
-                            state,
-                            masses,
-                            &mut self.bending_multipliers,
-                            center,
-                            rest_length,
-                            config.bending_rigidity,
-                            dt,
-                            held_payload.is_some(),
-                        );
-                    }
-                }
-            }
+        self.global_projection.begin_position_step(state);
+        for _ in 0..CONSTRAINT_SWEEPS {
+            self.global_projection.project_positions(
+                state,
+                masses,
+                rest_length,
+                scaled_compliance,
+                bending_weight,
+                held_payload.is_some(),
+            );
             state.positions[0] = config.anchor;
             if let Some(payload_position) = held_payload {
                 let payload = state.node_count() - 1;
@@ -150,34 +98,41 @@ impl XpbdRopeRelaxer {
     }
 
     fn resize(&mut self, node_count: usize) {
-        self.multipliers.resize(node_count.saturating_sub(1), 0.0);
-        self.bending_multipliers
-            .resize(node_count.saturating_sub(2), 0.0);
-        self.velocity_projection
-            .resize(node_count.saturating_sub(1));
+        self.global_projection.resize(node_count.saturating_sub(1));
     }
 }
 
-/// Mass-weighted projection onto the axial velocity constraints.
+/// Global mass-weighted projection onto the rope's interaction response.
 ///
-/// The constraint-space matrix is scalar tridiagonal because neighboring rope
-/// elements share exactly one node. A tiny diagonal regularization selects a
-/// stable impulse when a perfectly straight rope makes the endpoint-held
-/// constraint system rank deficient; it has negligible effect on velocities.
-struct VelocityProjection {
+/// Axial position projection is tridiagonal; adding the quadratic bending
+/// regularizer makes it pentadiagonal. The axial velocity constraint remains
+/// tridiagonal. All are solved directly so a prescribed endpoint correction
+/// reaches the whole rope in linear time instead of relying on local
+/// Gauss-Seidel propagation.
+struct GlobalProjection {
     directions: Vec<Vec2>,
     diagonal: Vec<f64>,
     upper: Vec<f64>,
-    right_hand_side: Vec<f64>,
+    second_upper: Vec<f64>,
+    first_lower: Vec<f64>,
+    second_lower: Vec<f64>,
+    velocity_right_hand_side: Vec<f64>,
+    position_right_hand_side: Vec<Vec2>,
+    position_targets: Vec<Vec2>,
 }
 
-impl VelocityProjection {
+impl GlobalProjection {
     fn new(element_count: usize) -> Self {
         Self {
             directions: vec![Vec2::ZERO; element_count],
             diagonal: vec![0.0; element_count],
             upper: vec![0.0; element_count.saturating_sub(1)],
-            right_hand_side: vec![0.0; element_count],
+            second_upper: vec![0.0; element_count.saturating_sub(2)],
+            first_lower: vec![0.0; element_count],
+            second_lower: vec![0.0; element_count],
+            velocity_right_hand_side: vec![0.0; element_count],
+            position_right_hand_side: vec![Vec2::ZERO; element_count],
+            position_targets: vec![Vec2::ZERO; element_count + 1],
         }
     }
 
@@ -185,10 +140,142 @@ impl VelocityProjection {
         self.directions.resize(element_count, Vec2::ZERO);
         self.diagonal.resize(element_count, 0.0);
         self.upper.resize(element_count.saturating_sub(1), 0.0);
-        self.right_hand_side.resize(element_count, 0.0);
+        self.second_upper
+            .resize(element_count.saturating_sub(2), 0.0);
+        self.first_lower.resize(element_count, 0.0);
+        self.second_lower.resize(element_count, 0.0);
+        self.velocity_right_hand_side.resize(element_count, 0.0);
+        self.position_right_hand_side
+            .resize(element_count, Vec2::ZERO);
+        self.position_targets.resize(element_count + 1, Vec2::ZERO);
     }
 
-    fn project(&mut self, state: &mut State, masses: &[f64], payload_velocity: Vec2) {
+    fn begin_position_step(&mut self, state: &State) {
+        self.resize(state.node_count().saturating_sub(1));
+        self.position_targets.clone_from(&state.positions);
+    }
+
+    fn project_positions(
+        &mut self,
+        state: &mut State,
+        masses: &[f64],
+        rest_length: f64,
+        scaled_compliance: f64,
+        bending_weight: f64,
+        payload_is_held: bool,
+    ) {
+        let element_count = state.node_count().saturating_sub(1);
+        if element_count == 0 {
+            return;
+        }
+        self.resize(element_count);
+        let payload = state.node_count() - 1;
+
+        for element in 0..element_count {
+            let delta = state.positions[element + 1] - state.positions[element];
+            let length = delta.length();
+            self.directions[element] = if length > f64::EPSILON {
+                delta / length
+            } else {
+                Vec2::new(if element.is_multiple_of(2) { 1.0 } else { -1.0 }, 0.0)
+            };
+        }
+
+        // This local/global step minimizes the same compliant spring-plus-
+        // inertia objective as the axial XPBD pass. Multiplying its normal
+        // equations by dt^2 gives k*dt^2 = 1/scaled_compliance.
+        let axial_weight = 1.0 / scaled_compliance;
+        let dynamic_end = if payload_is_held {
+            payload
+        } else {
+            payload + 1
+        };
+        let unknown_count = dynamic_end.saturating_sub(1);
+        if unknown_count == 0 {
+            return;
+        }
+        self.upper[..unknown_count.saturating_sub(1)].fill(0.0);
+        self.second_upper[..unknown_count.saturating_sub(2)].fill(0.0);
+        for local in 0..unknown_count {
+            let node = local + 1;
+            let has_right_element = node < payload;
+            let attached_elements = if has_right_element { 2.0 } else { 1.0 };
+            self.diagonal[local] = masses[node] + attached_elements * axial_weight;
+            self.position_right_hand_side[local] = self.position_targets[node] * masses[node]
+                + self.directions[node - 1] * (axial_weight * rest_length);
+            if has_right_element {
+                self.position_right_hand_side[local] -=
+                    self.directions[node] * (axial_weight * rest_length);
+            }
+            if local + 1 < unknown_count {
+                self.upper[local] = -axial_weight;
+            }
+        }
+
+        self.position_right_hand_side[0] += state.positions[0] * axial_weight;
+        if payload_is_held {
+            self.position_right_hand_side[unknown_count - 1] +=
+                state.positions[payload] * axial_weight;
+        }
+
+        if bending_weight > 0.0 {
+            let coefficients = [1.0, -2.0, 1.0];
+            for center in 1..payload {
+                let nodes = [center - 1, center, center + 1];
+                for a in 0..3 {
+                    let row_node = nodes[a];
+                    if !(1..dynamic_end).contains(&row_node) {
+                        continue;
+                    }
+                    let row = row_node - 1;
+                    self.diagonal[row] += bending_weight * coefficients[a] * coefficients[a];
+
+                    for b in a + 1..3 {
+                        let column_node = nodes[b];
+                        if (1..dynamic_end).contains(&column_node) {
+                            let column = column_node - 1;
+                            let value = bending_weight * coefficients[a] * coefficients[b];
+                            match column - row {
+                                1 => self.upper[row] += value,
+                                2 => self.second_upper[row] += value,
+                                _ => unreachable!("a bending stencil has bandwidth two"),
+                            }
+                        }
+                    }
+
+                    for b in 0..3 {
+                        let fixed_node = nodes[b];
+                        if !(1..dynamic_end).contains(&fixed_node) {
+                            self.position_right_hand_side[row] -= state.positions[fixed_node]
+                                * (bending_weight * coefficients[a] * coefficients[b]);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !solve_symmetric_pentadiagonal_vec2(
+            &mut self.diagonal[..unknown_count],
+            &self.upper[..unknown_count.saturating_sub(1)],
+            &self.second_upper[..unknown_count.saturating_sub(2)],
+            &mut self.position_right_hand_side[..unknown_count],
+            &mut self.first_lower[..unknown_count],
+            &mut self.second_lower[..unknown_count],
+        ) {
+            return;
+        }
+
+        for local in 0..unknown_count {
+            state.positions[local + 1] = self.position_right_hand_side[local];
+        }
+    }
+
+    /// Project free velocities onto the axial velocity constraints.
+    ///
+    /// A tiny diagonal regularization selects a stable impulse when a perfectly
+    /// straight rope makes the endpoint-held constraint system rank deficient;
+    /// it has negligible effect on velocities.
+    fn project_velocities(&mut self, state: &mut State, masses: &[f64], payload_velocity: Vec2) {
         let element_count = state.node_count().saturating_sub(1);
         if element_count == 0 {
             return;
@@ -213,12 +300,11 @@ impl VelocityProjection {
             self.diagonal[element] =
                 (left_inverse_mass + right_inverse_mass) * direction.length_squared();
             maximum_diagonal = maximum_diagonal.max(self.diagonal[element]);
-            self.right_hand_side[element] =
+            self.velocity_right_hand_side[element] =
                 -direction.dot(state.velocities[element + 1] - state.velocities[element]);
             if element + 1 < element_count {
-                let shared_inverse_mass = right_inverse_mass;
                 self.upper[element] =
-                    -shared_inverse_mass * direction.dot(self.directions[element + 1]);
+                    -right_inverse_mass * direction.dot(self.directions[element + 1]);
             }
         }
 
@@ -226,20 +312,16 @@ impl VelocityProjection {
         for diagonal in &mut self.diagonal {
             *diagonal += regularization;
         }
-        for index in 1..element_count {
-            let factor = self.upper[index - 1] / self.diagonal[index - 1];
-            self.diagonal[index] -= factor * self.upper[index - 1];
-            self.right_hand_side[index] -= factor * self.right_hand_side[index - 1];
-        }
-        self.right_hand_side[element_count - 1] /= self.diagonal[element_count - 1];
-        for index in (0..element_count - 1).rev() {
-            self.right_hand_side[index] = (self.right_hand_side[index]
-                - self.upper[index] * self.right_hand_side[index + 1])
-                / self.diagonal[index];
+        if !solve_symmetric_tridiagonal(
+            &mut self.diagonal,
+            &self.upper,
+            &mut self.velocity_right_hand_side,
+        ) {
+            return;
         }
 
         for element in 0..element_count {
-            let impulse = self.directions[element] * self.right_hand_side[element];
+            let impulse = self.directions[element] * self.velocity_right_hand_side[element];
             let left_inverse_mass = inverse_mass(masses, element, payload, true);
             let right_inverse_mass = inverse_mass(masses, element + 1, payload, true);
             state.velocities[element] -= impulse * left_inverse_mass;
@@ -250,41 +332,117 @@ impl VelocityProjection {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn project_bending_vertex(
-    state: &mut State,
-    masses: &[f64],
-    multipliers: &mut [f64],
-    center: usize,
-    rest_length: f64,
-    bending_rigidity: f64,
-    dt: f64,
-    payload_is_held: bool,
-) {
-    let Some(geometry) = crate::dynamics::bending::geometry(state, center) else {
-        return;
-    };
-    let nodes = [center - 1, center, center + 1];
-    let payload = state.node_count() - 1;
-    let inverse_masses = nodes.map(|node| inverse_mass(masses, node, payload, payload_is_held));
-    let scaled_compliance = rest_length / (bending_rigidity * dt * dt);
-    let denominator = scaled_compliance
-        + inverse_masses
-            .iter()
-            .zip(geometry.gradients)
-            .map(|(inverse_mass, gradient)| inverse_mass * gradient.length_squared())
-            .sum::<f64>();
-    if denominator <= 0.0 || !denominator.is_finite() {
-        return;
+fn solve_symmetric_pentadiagonal_vec2(
+    diagonal: &mut [f64],
+    first_upper: &[f64],
+    second_upper: &[f64],
+    right_hand_side: &mut [Vec2],
+    first_lower: &mut [f64],
+    second_lower: &mut [f64],
+) -> bool {
+    debug_assert_eq!(diagonal.len(), right_hand_side.len());
+    debug_assert_eq!(first_upper.len(), diagonal.len().saturating_sub(1));
+    debug_assert_eq!(second_upper.len(), diagonal.len().saturating_sub(2));
+    debug_assert_eq!(first_lower.len(), diagonal.len());
+    debug_assert_eq!(second_lower.len(), diagonal.len());
+    if diagonal.is_empty() {
+        return true;
     }
 
-    let multiplier = &mut multipliers[center - 1];
-    let change = (-geometry.angle - scaled_compliance * *multiplier) / denominator;
-    *multiplier += change;
-    for local in 0..3 {
-        state.positions[nodes[local]] +=
-            geometry.gradients[local] * (inverse_masses[local] * change);
+    first_lower.fill(0.0);
+    second_lower.fill(0.0);
+    for index in 0..diagonal.len() {
+        if index >= 2 {
+            let second_pivot = diagonal[index - 2];
+            if !second_pivot.is_finite() || second_pivot <= 0.0 {
+                return false;
+            }
+            second_lower[index] = second_upper[index - 2] / second_pivot;
+        }
+        if index >= 1 {
+            let first_pivot = diagonal[index - 1];
+            if !first_pivot.is_finite() || first_pivot <= 0.0 {
+                return false;
+            }
+            let coupling = if index >= 2 {
+                second_lower[index] * diagonal[index - 2] * first_lower[index - 1]
+            } else {
+                0.0
+            };
+            first_lower[index] = (first_upper[index - 1] - coupling) / first_pivot;
+        }
+        let first_term = if index >= 1 {
+            first_lower[index] * first_lower[index] * diagonal[index - 1]
+        } else {
+            0.0
+        };
+        let second_term = if index >= 2 {
+            second_lower[index] * second_lower[index] * diagonal[index - 2]
+        } else {
+            0.0
+        };
+        diagonal[index] -= first_term + second_term;
+        if !diagonal[index].is_finite() || diagonal[index] <= 0.0 {
+            return false;
+        }
     }
+
+    for index in 0..diagonal.len() {
+        if index >= 1 {
+            right_hand_side[index] -= right_hand_side[index - 1] * first_lower[index];
+        }
+        if index >= 2 {
+            right_hand_side[index] -= right_hand_side[index - 2] * second_lower[index];
+        }
+    }
+    for (value, &pivot) in right_hand_side.iter_mut().zip(diagonal.iter()) {
+        *value = *value / pivot;
+    }
+    for index in (0..diagonal.len()).rev() {
+        if index + 1 < diagonal.len() {
+            right_hand_side[index] -= right_hand_side[index + 1] * first_lower[index + 1];
+        }
+        if index + 2 < diagonal.len() {
+            right_hand_side[index] -= right_hand_side[index + 2] * second_lower[index + 2];
+        }
+    }
+    right_hand_side.iter().all(|value| value.is_finite())
+}
+
+fn solve_symmetric_tridiagonal(
+    diagonal: &mut [f64],
+    upper: &[f64],
+    right_hand_side: &mut [f64],
+) -> bool {
+    debug_assert_eq!(diagonal.len(), right_hand_side.len());
+    debug_assert_eq!(upper.len(), diagonal.len().saturating_sub(1));
+    if diagonal.is_empty() {
+        return true;
+    }
+
+    for index in 1..diagonal.len() {
+        let pivot = diagonal[index - 1];
+        if !pivot.is_finite() || pivot <= 0.0 {
+            return false;
+        }
+        let factor = upper[index - 1] / pivot;
+        diagonal[index] -= factor * upper[index - 1];
+        right_hand_side[index] -= factor * right_hand_side[index - 1];
+    }
+
+    let last = diagonal.len() - 1;
+    if !diagonal[last].is_finite() || diagonal[last] <= 0.0 {
+        return false;
+    }
+    right_hand_side[last] /= diagonal[last];
+    for index in (0..last).rev() {
+        if !diagonal[index].is_finite() || diagonal[index] <= 0.0 {
+            return false;
+        }
+        right_hand_side[index] =
+            (right_hand_side[index] - upper[index] * right_hand_side[index + 1]) / diagonal[index];
+    }
+    right_hand_side.iter().all(|value| value.is_finite())
 }
 
 fn damp_bending_velocities(
@@ -387,43 +545,6 @@ fn advance_material_state(config: &SimulationConfig, state: &mut State, rest_len
 }
 
 #[allow(clippy::too_many_arguments)]
-fn project_element(
-    state: &mut State,
-    masses: &[f64],
-    multipliers: &mut [f64],
-    element: usize,
-    rest_length: f64,
-    scaled_compliance: f64,
-    payload_is_held: bool,
-) {
-    let left = element;
-    let right = element + 1;
-    let delta = state.positions[right] - state.positions[left];
-    let length = delta.length();
-    let extension = length - rest_length;
-    let direction = if length > f64::EPSILON {
-        delta / length
-    } else {
-        Vec2::new(if element.is_multiple_of(2) { 1.0 } else { -1.0 }, 0.0)
-    };
-    let payload = state.node_count() - 1;
-    let left_inverse_mass = inverse_mass(masses, left, payload, payload_is_held);
-    let right_inverse_mass = inverse_mass(masses, right, payload, payload_is_held);
-    let denominator = left_inverse_mass + right_inverse_mass + scaled_compliance;
-    if denominator <= 0.0 {
-        return;
-    }
-
-    let old_multiplier = multipliers[element];
-    let multiplier_change = (-extension - scaled_compliance * old_multiplier) / denominator;
-    let new_multiplier = old_multiplier + multiplier_change;
-    let applied_change = new_multiplier - old_multiplier;
-    multipliers[element] = new_multiplier;
-
-    state.positions[left] -= direction * (left_inverse_mass * applied_change);
-    state.positions[right] += direction * (right_inverse_mass * applied_change);
-}
-
 fn inverse_mass(masses: &[f64], node: usize, payload: usize, payload_is_held: bool) -> f64 {
     if node == 0 || (payload_is_held && node == payload) {
         0.0
@@ -435,6 +556,52 @@ fn inverse_mass(masses: &[f64], node: usize, payload: usize, payload_is_held: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pentadiagonal_solver_recovers_a_known_vector_solution() {
+        let expected = [
+            Vec2::new(1.0, -2.0),
+            Vec2::new(-0.5, 3.0),
+            Vec2::new(2.5, 0.25),
+            Vec2::new(-1.5, -0.75),
+            Vec2::new(0.5, 1.25),
+        ];
+        let original_diagonal = [5.0, 6.0, 6.0, 6.0, 5.0];
+        let first_upper = [-2.0; 4];
+        let second_upper = [0.5; 3];
+        let mut right_hand_side = [Vec2::ZERO; 5];
+        for row in 0..expected.len() {
+            right_hand_side[row] += expected[row] * original_diagonal[row];
+            if row >= 1 {
+                right_hand_side[row] += expected[row - 1] * first_upper[row - 1];
+            }
+            if row + 1 < expected.len() {
+                right_hand_side[row] += expected[row + 1] * first_upper[row];
+            }
+            if row >= 2 {
+                right_hand_side[row] += expected[row - 2] * second_upper[row - 2];
+            }
+            if row + 2 < expected.len() {
+                right_hand_side[row] += expected[row + 2] * second_upper[row];
+            }
+        }
+        let mut diagonal = original_diagonal;
+        let mut first_lower = [0.0; 5];
+        let mut second_lower = [0.0; 5];
+
+        assert!(solve_symmetric_pentadiagonal_vec2(
+            &mut diagonal,
+            &first_upper,
+            &second_upper,
+            &mut right_hand_side,
+            &mut first_lower,
+            &mut second_lower,
+        ));
+
+        for (actual, expected) in right_hand_side.into_iter().zip(expected) {
+            assert!((actual - expected).length() < 1.0e-12);
+        }
+    }
 
     #[test]
     fn global_velocity_projection_enforces_axial_constraints() {
@@ -457,9 +624,9 @@ mod tests {
                 Vec2::ZERO,
             ];
             let masses = vec![1.0; state.node_count()];
-            let mut projection = VelocityProjection::new(state.node_count() - 1);
+            let mut projection = GlobalProjection::new(state.node_count() - 1);
 
-            projection.project(&mut state, &masses, Vec2::ZERO);
+            projection.project_velocities(&mut state, &masses, Vec2::ZERO);
 
             for element in 0..state.node_count() - 1 {
                 let delta = state.positions[element + 1] - state.positions[element];

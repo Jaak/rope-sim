@@ -74,6 +74,28 @@ fn replay_scenario(
                 .unwrap_or(scenario.duration)
         });
     let mut settling_probe_speed = None;
+    let taut_probe_time =
+        (path.file_stem().and_then(|name| name.to_str()) == Some("bug-7")).then(|| {
+            scenario
+                .commands
+                .iter()
+                .find_map(|timed| {
+                    matches!(timed.command, MotionCommand::Release { .. }).then_some(timed.time)
+                })
+                .unwrap_or(scenario.duration)
+        });
+    let mut taut_probe = None;
+    let smooth_slack_probe_time =
+        (path.file_stem().and_then(|name| name.to_str()) == Some("bug-8-1")).then(|| {
+            scenario
+                .commands
+                .iter()
+                .find_map(|timed| {
+                    matches!(timed.command, MotionCommand::Release { .. }).then_some(timed.time)
+                })
+                .unwrap_or(scenario.duration)
+        });
+    let mut smooth_slack_probe = None;
     // bug-4-1 records the slow-moving-boundary regression. Its final command
     // releases an 80 kg payload with roughly 11 m of slack below it; the later
     // free-fall/catch is a separate integrator stress case, not drag validation.
@@ -127,6 +149,27 @@ fn replay_scenario(
             {
                 settling_probe_speed = Some(current_speed);
             }
+            if taut_probe.is_none()
+                && taut_probe_time.is_some_and(|probe| {
+                    simulation.diagnostics().simulation_time + TIME_EPSILON >= probe
+                })
+            {
+                let shape = rope_shape(&simulation);
+                taut_probe = Some(shape);
+            }
+            if smooth_slack_probe.is_none()
+                && smooth_slack_probe_time.is_some_and(|probe| {
+                    simulation.diagnostics().simulation_time + TIME_EPSILON >= probe
+                })
+            {
+                let diagnostics = simulation.diagnostics();
+                smooth_slack_probe = Some((
+                    rope_shape(&simulation).2,
+                    diagnostics.maximum_curvature,
+                    diagnostics.minimum_segment_length,
+                    diagnostics.maximum_node_speed,
+                ));
+            }
         }
     }
     apply_due_commands(scenario, &mut simulation, &mut next_command)?;
@@ -173,7 +216,63 @@ fn replay_scenario(
             integrator.display_name()
         ));
     }
+    if let Some((geometric_slack, maximum_deviation, _)) = taut_probe
+        && (geometric_slack >= 0.001 || maximum_deviation >= 0.02)
+    {
+        return Err(format!(
+            "{} retained {:.3} m of geometric slack and {:.3} m maximum deviation while held taut with {}",
+            path.display(),
+            geometric_slack,
+            maximum_deviation,
+            integrator.display_name()
+        ));
+    }
+    if let Some((contour_length, maximum_curvature, minimum_length, maximum_speed)) =
+        smooth_slack_probe
+        && ((contour_length - scenario.config.rope_length).abs() >= 0.02
+            || maximum_curvature >= 40.0
+            || minimum_length <= 0.95 * simulation.rest_length()
+            || maximum_speed >= 3.0)
+    {
+        return Err(format!(
+            "{} retained a kinked held state with {}: contour {:.3} m, curvature {:.1} 1/m, minimum element {:.4} m, speed {:.3} m/s",
+            path.display(),
+            integrator.display_name(),
+            contour_length,
+            maximum_curvature,
+            minimum_length,
+            maximum_speed,
+        ));
+    }
     Ok(())
+}
+
+fn rope_shape(simulation: &Simulation) -> (f64, f64, f64) {
+    let positions = simulation.positions();
+    let anchor = positions[0];
+    let chord = positions[positions.len() - 1] - anchor;
+    let chord_length = chord.length();
+    let direction = if chord_length > f64::EPSILON {
+        chord / chord_length
+    } else {
+        chord
+    };
+    let contour_length: f64 = positions
+        .windows(2)
+        .map(|nodes| (nodes[1] - nodes[0]).length())
+        .sum();
+    let maximum_deviation = positions
+        .iter()
+        .map(|position| {
+            let relative = *position - anchor;
+            (relative - direction * relative.dot(direction)).length()
+        })
+        .fold(0.0_f64, f64::max);
+    (
+        contour_length - chord_length,
+        maximum_deviation,
+        contour_length,
+    )
 }
 
 fn apply_due_commands(
